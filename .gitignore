@@ -1,0 +1,12 @@
+token.json
+credentials.json
+.env
+cache/
+index.json
+__pycache__/
+*.pyc
+*.log
+*.err
+ready_tables.json
+stage2_args.txt
+*.out

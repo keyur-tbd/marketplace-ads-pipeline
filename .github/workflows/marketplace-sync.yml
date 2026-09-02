@@ -1,0 +1,104 @@
+name: Market Place Data -> Supabase
+
+# Incremental sync. Files are read from the same Google Drive folder as the
+# local runs - Drive is the source in both cases. What differs is that a runner
+# is thrown away afterwards, so the download cache does not survive. That is
+# fine: the mp_loaded_files ledger means a run only fetches files it has never
+# loaded, so a monthly sync pulls the new month, not the 5 GB back-history.
+#
+# The initial backfill is NOT run here. It moved ~22M rows over roughly two
+# days, which does not fit in a job. Backfill locally once, then let this keep
+# it current.
+
+on:
+  schedule:
+    # 02:30 UTC = 08:00 IST on the 2nd of each month, giving the marketplace
+    # teams the first of the month to finish uploading the previous month.
+    - cron: "30 2 2 * *"
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: "Limit to source keys, space separated (blank = all)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Parse only, write nothing"
+        type: boolean
+        default: false
+
+# Never let two syncs overlap: they would fight over the same tables and each
+# would re-download what the other is already fetching.
+concurrency:
+  group: marketplace-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330        # under the 6h job ceiling, with room to spare
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Write credentials
+        env:
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: |
+          # The OAuth refresh token works headlessly; no browser step is needed.
+          printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
+          python -c "import json;json.load(open('token.json'));print('token.json parsed OK')"
+
+      - name: Check connectivity
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -m mp.pipeline --check
+
+      - name: Refresh the Drive index
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        # index.json is not committed: new month folders appear constantly, so
+        # it is rebuilt each run (~460 API calls, about two minutes).
+        run: python -m mp.pipeline --refresh-index
+
+      - name: Sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Runners have ~14 GB free. Files are deleted as we go so a month of
+          # Instamart (~350 MB each) cannot accumulate into a full disk.
+          MP_KEEP_CACHE: "0"
+        run: |
+          ARGS=""
+          for s in ${{ github.event.inputs.sources }}; do ARGS="$ARGS --source $s"; done
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          # Deliberately no --reload: that would re-read all 3,619 files and
+          # cannot finish inside a job.
+          python -m mp.pipeline --run $ARGS
+
+      - name: Report table sizes
+        if: always()
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: python -m mp.pipeline --sizes || echo "size report unavailable"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log
+          path: |
+            index.json
+          retention-days: 14

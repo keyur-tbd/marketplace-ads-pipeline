@@ -1,0 +1,9 @@
+google-api-python-client>=2.180
+google-auth>=2.40
+google-auth-httplib2>=0.2
+google-auth-oauthlib>=1.2
+pandas>=2.2
+openpyxl>=3.1
+xlrd>=2.0
+supabase>=2.20
+pg8000>=1.31
