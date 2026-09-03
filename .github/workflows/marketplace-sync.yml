@@ -76,6 +76,17 @@ jobs:
           # Runners have ~14 GB free. Files are deleted as we go so a month of
           # Instamart (~350 MB each) cannot accumulate into a full disk.
           MP_KEEP_CACHE: "0"
+          # The disk guard needs to reach Postgres directly - PostgREST cannot
+          # report sizes. Same secrets the "Report table sizes" step uses.
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
         run: |
           ARGS=""
           for s in ${{ github.event.inputs.sources }}; do ARGS="$ARGS --source $s"; done

@@ -446,6 +446,10 @@ def cmd_run(keys: Optional[List[str]], dry_run: bool, limit: Optional[int],
 
 # --------------------------------------------------------------------------- #
 
+sys.path.insert(0, PROJECT)  # etl_alerts.py lives at the repo root
+from etl_alerts import guard  # noqa: E402
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     load_dotenv(os.path.join(PROJECT, ".env"))
     p = argparse.ArgumentParser(
@@ -519,6 +523,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.check:
         return cmd_check()
     if args.run:
+        # Shared disk guard. Only on the WRITE path: --sizes and --check must
+        # stay usable when the volume is full, since those are what you run to
+        # find out why. --dry-run writes nothing, so it is exempt too.
+        if not args.dry_run:
+            guard("marketplace")
         return cmd_run(args.source, args.dry_run, args.limit, args.since,
                        args.reload)
     p.print_help()
