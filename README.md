@@ -57,6 +57,19 @@ Three "Power BI Upload" monthly rollups (BB, Flipkart, Amazon — Apr–Sep 2025
 before the daily exports begin) are not in the spec and are mapped by analogy;
 see the `note` on each in `mp/sources.py`.
 
+**No store column, by decision.** Only Instamart exports a store identifier
+(`store_id`, `area_name`); every other platform's finest geography is city
+(First Club's `fcn` is a sequential order reference, Amazon PI's `postalcode`
+is the delivery pincode, Amazon Vendor's `spoke` is empty). A column present
+for one platform of ten was judged not worth adding. Two consequences:
+
+- On Instamart, `COUNT(*)` counts sale lines across stores, not distinct
+  SKU-days — 74% of its rows are identical on the six columns because they are
+  different stores. `SUM(qty)` is correct; that is what the repeats are for.
+- Adding a column later means a **purge and reload** of the affected platform,
+  not a backfill: dropped columns are gone at read time (no `raw_data` here),
+  and a new hashed column changes every row's identity. Instamart is ~2 hours.
+
 ## Setup
 
 `.env` next to this README (real environment variables always win):
