@@ -12,9 +12,10 @@ name: Market Place Data -> Supabase
 
 on:
   schedule:
-    # 02:30 UTC = 08:00 IST on the 2nd of each month, giving the marketplace
-    # teams the first of the month to finish uploading the previous month.
-    - cron: "30 2 2 * *"
+    # 08:30 UTC = 14:00 IST, daily. Each run loads only files the ledger has
+    # not seen, so a daily cadence costs a few minutes and keeps Supabase
+    # within a day of Drive.
+    - cron: "30 8 * * *"
   workflow_dispatch:
     inputs:
       sources:

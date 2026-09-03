@@ -194,8 +194,8 @@ Zepto is ~60% of the total on its own (~5M rows from 1,073 daily workbooks).
 
 ## Running it on GitHub Actions
 
-`.github/workflows/marketplace-sync.yml` runs the sync monthly (02:30 UTC on the
-2nd, i.e. 08:00 IST) and on demand.
+`.github/workflows/marketplace-sync.yml` runs the sync daily at 14:00 IST
+(08:30 UTC) and on demand.
 
 **Where does it get the files?** From the same Google Drive folder, over the
 Drive API. Drive is the source whether it runs here or on your laptop — nothing
