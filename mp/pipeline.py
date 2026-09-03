@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from . import dbadmin, drive, schema
-from .readers import date_from_filename, read_file
+from .readers import WrongShape, date_from_filename, read_file
 from .schema import COMMON_DATE, COMMON_TEXT
 from .sink import SupabaseSink, build_rows, load_dotenv, mask
 from .sources import Source, get_source, ordered_sources, tables
@@ -119,6 +119,10 @@ def cmd_discover(keys: Optional[List[str]], max_files: int) -> int:
             existing = json.load(fh)
 
     for s in select_sources(keys):
+        if s.projected:
+            logger.info("[DISCOVER] %s: projected source, schema is fixed - skipped",
+                        s.key)
+            continue
         types = schema.discover(s, svc, index, max_files=max_files)
         if not types:
             continue
@@ -242,7 +246,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
     files = [f for f in drive.files_for(s, index) if _within_since(f, since)]
     seen = len(files)
 
-    types = types_by_table.get(s.table)
+    types = s.fixed_types() if s.projected else types_by_table.get(s.table)
     if not types:
         logger.warning("[%s] no discovered columns for table %s - run --discover",
                        s.key, s.table)
@@ -275,6 +279,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
     # The source's real column shape, used to spot a file of the wrong
     # report type before any of its rows are built.
     core = {c for c in types if c not in schema._PROVENANCE}
+    date_key = "sale_date" if s.projected else "report_date"
     unmapped: Dict[str, int] = defaultdict(int)
     no_date = 0
     failures: List[str] = []
@@ -300,7 +305,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                 # 'Monthly - Keyword wise Format'); loading it would put 365
                 # rows of the wrong shape into the table, with every real column
                 # null and the actual values buried in raw_data.
-                if first:
+                if first and not s.projected:
                     first = False
                     overlap = schema.shape_overlap(set(batch[0]), core)
                     if overlap < schema.SHAPE_MIN_OVERLAP:
@@ -312,7 +317,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                         break
                 file_rows += len(batch)
                 for row in batch:
-                    if row.get("report_date") is None:
+                    if row.get(date_key) is None:
                         no_date += 1
                     for col in row:
                         if col not in types:
@@ -320,12 +325,17 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                 # Built even on a dry run, so type coercion, hashing and
                 # de-duplication are exercised against every row rather than
                 # only at load time.
-                db_rows, repeated = build_rows(batch, types, occurrences)
+                db_rows, repeated = build_rows(batch, types, occurrences,
+                                               raw=not s.projected)
                 repeats += repeated
                 if not dry_run and sink:
                     rows_written += sink.upsert(s.table, db_rows)
                     if db_rows:
                         probes.append(db_rows[0]["row_hash"])
+        except WrongShape as exc:
+            logger.warning("[%s] SKIPPED %s - %s", s.key, meta["name"], exc)
+            misfiled.append(f"{meta['name']} (no mapped columns)")
+            continue
         except Exception as exc:  # noqa: BLE001
             logger.error("[%s] read failed %s: %s", s.key, meta["name"], exc)
             failures.append(f"{meta['name']}: read {exc}")

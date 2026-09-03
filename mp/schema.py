@@ -15,7 +15,8 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import drive, readers
-from .sources import ID_COLUMNS, Source, ordered_sources
+from .sources import (ID_COLUMNS, SALES_COLUMNS, SALES_TABLE, SALES_TYPES,
+                      Source, ordered_sources)
 
 logger = logging.getLogger("mp.schema")
 
@@ -303,6 +304,43 @@ comment on table public.{LOADED_TABLE} is
      that file succeeded, so an interrupted run resumes without gaps.';"""
 
 
+def build_sales_table_sql() -> str:
+    """The unified sales table. Fixed, not discovered.
+
+    Exactly the six columns of 'Sales Column Name for All Platform.xlsx' -
+    platform plus SKU Code, SKU Name, Date, QTY, Sub City - and the minimal
+    provenance the ledger and dedup need. No raw_data: the requirement is that
+    only the named columns reach the database.
+    """
+    cols = "\n".join(
+        f"    {c.ljust(14)} {SALES_TYPES.get(c, 'text')},"
+        for c in ["platform"] + SALES_COLUMNS)
+    return f"""-- {SALES_TABLE}: 5) Sales Raw Data, all platforms, projected to the spec's
+-- six columns. Scootsy rows carry platform = 'Instamart'.
+create table if not exists public.{SALES_TABLE} (
+    id             bigint generated always as identity primary key,
+    row_hash       text        not null unique,
+{cols}
+    source_file    text,
+    drive_file_id  text,
+    processed_at   timestamptz not null default now(),
+    created_at     timestamptz not null default now()
+);
+
+alter table public.{SALES_TABLE}
+    add column if not exists source_file_lower text
+    generated always as (lower(source_file)) stored;
+
+create index if not exists {SALES_TABLE}_source_file_lower_idx
+    on public.{SALES_TABLE} (source_file_lower);
+create index if not exists {SALES_TABLE}_sale_date_idx
+    on public.{SALES_TABLE} (sale_date);
+create index if not exists {SALES_TABLE}_platform_idx
+    on public.{SALES_TABLE} (platform);
+create index if not exists {SALES_TABLE}_sku_code_idx
+    on public.{SALES_TABLE} (sku_code);"""
+
+
 def build_log_table_sql() -> str:
     return f"""create table if not exists public.{LOG_TABLE} (
     id               bigint generated always as identity primary key,
@@ -371,6 +409,10 @@ def build_all_sql(discovered: Dict[str, Dict[str, str]]) -> str:
         "",
     ]
     for table, srcs in by_table.items():
+        if all(s.projected for s in srcs):
+            parts.append(build_sales_table_sql())
+            parts.append("")
+            continue
         types = discovered.get(table)
         if not types:
             parts.append(f"-- {table}: discovery found no columns (no readable "

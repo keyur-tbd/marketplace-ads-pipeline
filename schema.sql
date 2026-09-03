@@ -3008,3 +3008,33 @@ create index if not exists zepto_campaign_performance_platform_idx on public.zep
 -- column (re-run --discover). Add the index only if you really need it:
 --   create index zepto_campaign_performance_raw_data_idx on public.zepto_campaign_performance using gin (raw_data);
 
+-- mp_sales: 5) Sales Raw Data, all platforms, projected to the spec's
+-- six columns. Scootsy rows carry platform = 'Instamart'.
+create table if not exists public.mp_sales (
+    id             bigint generated always as identity primary key,
+    row_hash       text        not null unique,
+    platform       text,
+    sku_code       text,
+    sku_name       text,
+    sale_date      date,
+    qty            numeric,
+    sub_city       text,
+    source_file    text,
+    drive_file_id  text,
+    processed_at   timestamptz not null default now(),
+    created_at     timestamptz not null default now()
+);
+
+alter table public.mp_sales
+    add column if not exists source_file_lower text
+    generated always as (lower(source_file)) stored;
+
+create index if not exists mp_sales_source_file_lower_idx
+    on public.mp_sales (source_file_lower);
+create index if not exists mp_sales_sale_date_idx
+    on public.mp_sales (sale_date);
+create index if not exists mp_sales_platform_idx
+    on public.mp_sales (platform);
+create index if not exists mp_sales_sku_code_idx
+    on public.mp_sales (sku_code);
+

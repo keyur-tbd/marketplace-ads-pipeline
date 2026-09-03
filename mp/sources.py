@@ -99,6 +99,14 @@ class Source:
                 Extra columns to force to text.
     platform    Platform tag written into every row of this source.
     exclude     Path fragments under `folder` to skip.
+    select      Projection mode. {target_column: source_column | FILENAME |
+                ComposeDate(...)}. When set, ONLY these columns are read - every
+                other column in the file is dropped, there is no raw_data, and
+                the table schema is fixed (see `fixed_types`) rather than
+                discovered. Header detection anchors on the mapped source
+                columns, so a metadata preamble above the header is skipped
+                automatically. Used for 5) Sales Raw Data, whose spec workbook
+                names exactly six columns per platform.
     """
 
     def __init__(self, key: str, order: str, table: str, folder: str,
@@ -109,7 +117,9 @@ class Source:
                  date_columns: Sequence[str] = (),
                  text_columns: Sequence[str] = (),
                  exclude: Sequence[str] = (),
-                 note: str = ""):
+                 note: str = "",
+                 select: Optional[Dict[str, object]] = None,
+                 only: Sequence[str] = ()):
         self.key = key
         self.order = order
         self.table = table
@@ -123,9 +133,68 @@ class Source:
         self.text_columns = list(text_columns)
         self.exclude = list(exclude)
         self.note = note
+        self.select = dict(select) if select else None
+        #: Path fragments a file MUST contain to belong here. Lets two sources
+        #: share a folder that mixes two report shapes (Vendor Central dailies
+        #: alongside its 'Power BI Upload' monthlies).
+        self.only = list(only)
+
+    @property
+    def projected(self) -> bool:
+        return self.select is not None
+
+    @property
+    def anchor_columns(self) -> List[str]:
+        """Plain source columns the header row must contain (projection mode)."""
+        if not self.select:
+            return []
+        out = []
+        for rule in self.select.values():
+            if isinstance(rule, str) and rule != FILENAME:
+                out.append(rule)
+            elif isinstance(rule, ComposeDate):
+                out.extend(rule.columns)
+        return out
+
+    def fixed_types(self) -> Dict[str, str]:
+        """Column types for a projected source: the target columns, typed by
+        SALES_TYPES, plus the minimal provenance the ledger and dedup need."""
+        if not self.select:
+            return {}
+        out = {"platform": "text"}
+        for target in SALES_COLUMNS:
+            out[target] = SALES_TYPES.get(target, "text")
+        out["source_file"] = "text"
+        out["drive_file_id"] = "text"
+        return out
 
     def __repr__(self) -> str:
         return f"<Source {self.key} -> {self.table}>"
+
+
+#: Projection sentinel: the value comes from the file name, not a column.
+FILENAME = "@filename"
+
+
+class ComposeDate:
+    """A date assembled from separate day / month / year columns.
+
+    Amazon PI exports the order date as three integer columns
+    (orderDay=27, orderMonth=7, orderYear=2026) rather than one field.
+    """
+
+    def __init__(self, day: str, month: str, year: str):
+        self.columns = [day, month, year]
+
+    def __repr__(self) -> str:
+        return f"ComposeDate({', '.join(self.columns)})"
+
+
+#: The unified sales columns, in table order, straight from the spec workbook:
+#: SKU Code, SKU Name, Date, QTY, Sub City.
+SALES_COLUMNS = ["sku_code", "sku_name", "sale_date", "qty", "sub_city"]
+#: Types of those columns. Everything not listed is text.
+SALES_TYPES = {"sale_date": "date", "qty": "numeric"}
 
 
 # --------------------------------------------------------------------------- #
@@ -321,9 +390,120 @@ _ZEPTO: List[Source] = [
                 "(19-Jan-26.xlsx) is the report date."),
 ]
 
+# --------------------------------------------------------------------------- #
+# 5: Sales raw exports -> ONE table, six columns, per the spec workbook.       #
+# --------------------------------------------------------------------------- #
+#
+# "Sales Column Name for All Platform.xlsx" names, for each platform, which
+# source column feeds each of: SKU Code, SKU Name, Date, QTY, Sub City. Only
+# those are loaded. Everything else in the files - MRP, GMV, categories, store
+# ids, brand, EAN - is dropped at read time and never reaches Postgres.
+#
+# `platform` is the spec's own label ("BB Gamma Sales", "Instamart", ...) so the
+# table matches the spec exactly. Scootsy is Instamart, per the standing rule.
+
+_SALES = "5) Sales Raw Data"
+SALES_TABLE = "mp_sales"
+
+
+def _sales(key, order, folder, platform, report, select, **kw):
+    return Source(key, order, SALES_TABLE, f"{_SALES}/{folder}", platform,
+                  report, select=select, **kw)
+
+
+_SALES_SOURCES: List[Source] = [
+    # -- Amazon PI: two category folders, same shape. Date is day/month/year.
+    _sales("sales_amazon_pi_bakery", "5.1", "Amazon PI/Grocery - Bakery",
+           "Amazon PI", "PI grocery sales - bakery",
+           {"sku_code": "asin", "sku_name": "itemname",
+            "sale_date": ComposeDate("orderday", "ordermonth", "orderyear"),
+            "qty": "netunits", "sub_city": "city"}),
+    _sales("sales_amazon_pi_snacks", "5.1", "Amazon PI/Grocery - Snacks Food",
+           "Amazon PI", "PI grocery sales - snacks",
+           {"sku_code": "asin", "sku_name": "itemname",
+            "sale_date": ComposeDate("orderday", "ordermonth", "orderyear"),
+            "qty": "netunits", "sub_city": "city"}),
+
+    # -- Amazon Vendor Central: daily workbooks with a metadata row above the
+    #    header. The header anchors on 'asin', so that row is skipped. The spec
+    #    lists no sub city for this platform.
+    _sales("sales_amazon_vendor", "5.2", "Amazon Vendore Portal",
+           "Amazon Vendor Central", "Vendor Central shipped units",
+           {"sku_code": "asin", "sku_name": "product_title",
+            "sale_date": FILENAME, "qty": "shipped_units"},
+           exclude=["Power BI Upload"],
+           note="Folder is misspelled 'Vendore' in Drive; kept verbatim."),
+    # The 'Power BI Upload' monthly files in that folder are a different
+    # report (ordered units by city). Not in the spec; mapped by analogy so
+    # the Apr-25 to Sep-25 history is not lost. CONFIRM this mapping.
+    _sales("sales_amazon_vendor_powerbi", "5.2", "Amazon Vendore Portal",
+           "Amazon Vendor Central", "Vendor Central monthly (Power BI upload)",
+           {"sku_code": "asin", "sku_name": "item_name",
+            "sale_date": "order_day", "qty": "finla_qty", "sub_city": "city"},
+           only=["Power BI Upload"],
+           note="Inferred mapping - not in the spec workbook. 'ordered_units' "
+                "is empty in these files; 'finla_qty' is the populated one."),
+
+    # -- Big Basket: three daily report shapes, plus monthly Power BI rollups.
+    _sales("sales_bb_daily", "5.3", "Big Basket/BB Daily Sales",
+           "BB Daily", "BB daily sales",
+           {"sku_code": "source_product_id", "sku_name": "sku_name",
+            "sale_date": FILENAME, "qty": "quantity", "sub_city": "city_name"}),
+    _sales("sales_bb_gamma", "5.3", "Big Basket/BB Gamma Sales",
+           "BB Gamma Sales", "BB gamma sales",
+           {"sku_code": "source_sku_id", "sku_name": "sku_description",
+            "sale_date": FILENAME, "qty": "total_quantity",
+            "sub_city": "source_city_name"}),
+    _sales("sales_bb_instant", "5.3", "Big Basket/BB Instant Sales",
+           "BB Instant Sales", "BB instant sales",
+           {"sku_code": "source_sku_id", "sku_name": "sku_description",
+            "sale_date": FILENAME, "qty": "quantity", "sub_city": "location_city"}),
+    _sales("sales_bb_powerbi", "5.3", "Big Basket/BB Apr-25 To Sep-25 Data",
+           "BB Daily", "BB monthly (Power BI upload), Apr-Sep 25",
+           {"sku_code": "sku", "sku_name": "product_name", "sale_date": "date",
+            "qty": "quantity", "sub_city": "sub_city"},
+           note="Inferred mapping - not in the spec workbook. Back-history for "
+                "the months before the daily exports begin."),
+
+    # -- Blinkit
+    _sales("sales_blinkit", "5.4", "Blinkit", "Blinkit", "Blinkit daily sales",
+           {"sku_code": "item_id", "sku_name": "item_name", "sale_date": "date",
+            "qty": "qty_sold", "sub_city": "city_name"}),
+
+    # -- Flipkart: dailies (no date column) plus monthly Power BI rollups.
+    _sales("sales_flipkart_daily", "5.5", "Flipkart/Flipkart Daily Sales",
+           "Flipkart", "Flipkart daily sales",
+           {"sku_code": "sku_code", "sku_name": "sku_name", "sale_date": FILENAME,
+            "qty": "quantity", "sub_city": "city"}),
+    _sales("sales_flipkart_powerbi", "5.5",
+           "Flipkart/Flipkart Apr-25 To Sep-25 Data",
+           "Flipkart", "Flipkart monthly (Power BI upload), Apr-Sep 25",
+           {"sku_code": "sku_code", "sale_date": "date", "qty": "quantity",
+            "sub_city": "city"},
+           note="Inferred mapping - not in the spec workbook. These files carry "
+                "no SKU name, so sku_name is null for them."),
+
+    # -- Instamart, filed as Scootsy in Drive.
+    _sales("sales_instamart", "5.6", "Scootsy", "Instamart", "Instamart daily sales",
+           {"sku_code": "item_code", "sku_name": "product_name",
+            "sale_date": "ordered_date", "qty": "units_sold", "sub_city": "city"},
+           note="Scootsy is Instamart. The folder keeps the old name."),
+
+    # -- Zepto
+    _sales("sales_zepto", "5.7", "Zepto", "Zepto", "Zepto daily sales",
+           {"sku_code": "sku_number", "sku_name": "sku_name", "sale_date": "date",
+            "qty": "sales_qty_units", "sub_city": "city"}),
+
+    # -- First Club
+    _sales("sales_firstclub", "5.8", "First Club", "First Club",
+           "First Club daily sales",
+           {"sku_code": "sku_code", "sku_name": "product_name",
+            "sale_date": "sale_date", "qty": "sum_of_units_sold", "sub_city": "city"}),
+]
+
 SOURCES: Dict[str, Source] = {
     s.key: s for s in _SPLIT + _AMAZON + _BIGBASKET + _BLINKIT + _FLIPKART
-    + _INSTAMART + _ZEPTO
+    + _INSTAMART + _ZEPTO + _SALES_SOURCES
 }
 
 

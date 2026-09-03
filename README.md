@@ -26,6 +26,37 @@ export, kept as the audit / drill-down layer.
 **Scootsy is Instamart.** The rename is applied to platform *values* inside the
 data, not just to folder names, via `PLATFORM_ALIASES` in `mp/sources.py`.
 
+### 5) Sales Raw Data — one table, six columns
+
+The sales folder is handled differently from the ads folders, on purpose. Rather
+than one table per report with every column discovered, all eight platforms
+land in **one table, `mp_sales`**, with exactly the columns named in
+`Sales Column Name for All Platform.xlsx`:
+
+| Column | Source, per platform |
+|---|---|
+| `platform` | the spec's label — `Amazon PI`, `BB Daily`, `BB Gamma Sales`, `BB Instant Sales`, `Blinkit`, `Flipkart`, `Instamart`, `Zepto`, `First Club`, `Amazon Vendor Central` |
+| `sku_code` | asin / source_product_id / source_sku_id / item_id / sku_code / item_code / sku_number … |
+| `sku_name` | itemName / sku_name / sku_description / item_name / product_name / product_title … |
+| `sale_date` | a date column, the file name, or (Amazon PI) composed from orderDay + orderMonth + orderYear |
+| `qty` | netUnits / quantity / total_quantity / qty_sold / units_sold / shipped_units … |
+| `sub_city` | city / city_name / source_city_name / location_city (none for Vendor Central) |
+
+**Everything else in those files is dropped at read time** — MRP, GMV,
+categories, store ids, brand, EAN never reach Postgres, and there is no
+`raw_data` on this table. The mapping lives in `mp/sources.py` as a `select`
+dict per source (projection mode), so it is identical locally and on GitHub
+Actions. Scootsy is loaded as `platform = 'Instamart'`.
+
+Header detection for these sources anchors on the mapped columns themselves,
+which is what lets Amazon Vendor Central's metadata row be skipped and makes a
+file with none of the mapped columns get reported as misfiled instead of loaded
+as nulls.
+
+Three "Power BI Upload" monthly rollups (BB, Flipkart, Amazon — Apr–Sep 2025,
+before the daily exports begin) are not in the spec and are mapped by analogy;
+see the `note` on each in `mp/sources.py`.
+
 ## Setup
 
 `.env` next to this README (real environment variables always win):

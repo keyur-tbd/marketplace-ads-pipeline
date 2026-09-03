@@ -28,11 +28,21 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 
-from .sources import PLATFORM_ALIASES, Source
+from .sources import FILENAME, PLATFORM_ALIASES, SALES_COLUMNS, ComposeDate, Source
 
 logger = logging.getLogger("mp.readers")
 
 BATCH = 5000
+
+
+class WrongShape(Exception):
+    """A projected source's file has none of the mapped columns.
+
+    For sales sources the mapped columns are the report's signature. A file
+    in that folder lacking them is a different report filed in the wrong place,
+    and loading it would produce rows of nulls. Raised so the pipeline records
+    the file as misfiled instead of loading it.
+    """
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7,
@@ -268,6 +278,74 @@ def find_header_row(frame: pd.DataFrame, limit: int = 10) -> int:
     return 0
 
 
+def find_anchored_header(rows: List[List[Any]], anchors: List[str],
+                         limit: int = 25) -> Optional[int]:
+    """First row whose normalized cells contain every anchor column.
+
+    For projected sources the mapped columns ARE the header signature, which
+    makes detection exact rather than heuristic: Amazon Vendor Central's daily
+    workbooks open with a one-row metadata block ('Programme=[Retail]',
+    'Currency=[INR]', ...) that looks header-like to a generic scorer but never
+    contains 'asin', so it is skipped and the real header on row 1 is found.
+    Returns None if no row qualifies, so the caller can fall back.
+    """
+    wanted = set(anchors)
+    if not wanted:
+        return None
+    for i, cells in enumerate(rows[:limit]):
+        cols = set(normalize_columns(cells))
+        if wanted <= cols:
+            return i
+    return None
+
+
+def _excel_serial_parts(v: Any) -> Optional[int]:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def compose_date(row: Dict[str, Any], rule: ComposeDate) -> Optional[str]:
+    """Day / month / year columns -> ISO date. Any part missing -> None."""
+    d, m, y = (_excel_serial_parts(row.get(c)) for c in rule.columns)
+    if d is None or m is None or y is None:
+        return None
+    if y < 100:
+        y += 2000
+    try:
+        return dt.date(y, m, d).isoformat()
+    except ValueError:
+        return None
+
+
+def project_row(row: Dict[str, Any], source: Source, meta: dict,
+                file_date: Optional[str]) -> Dict[str, Any]:
+    """Keep only the spec's columns. Everything else in `row` is dropped here.
+
+    Output keys are exactly: platform, the SALES_COLUMNS (absent ones null),
+    source_file and drive_file_id. No raw_data - the requirement is that only
+    the named columns reach the database.
+    """
+    out: Dict[str, Any] = {"platform": source.platform}
+    # Every spec column is always present. A platform the spec gives no
+    # sub-city for (Amazon Vendor Central) still yields sub_city=None, so all
+    # rows share one shape and the hash never depends on which keys exist.
+    for target in SALES_COLUMNS:
+        rule = source.select.get(target)
+        if rule is None:
+            out[target] = None
+        elif rule == FILENAME:
+            out[target] = file_date
+        elif isinstance(rule, ComposeDate):
+            out[target] = compose_date(row, rule)
+        else:
+            out[target] = row.get(rule)
+    out["source_file"] = meta["name"]
+    out["drive_file_id"] = meta["id"]
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Flipkart preamble                                                            #
 # --------------------------------------------------------------------------- #
@@ -367,7 +445,20 @@ def read_excel(path: str, source: Source) -> Iterator[List[Dict[str, Any]]]:
     raw = xl.parse(sheet, header=None, dtype=object)
     if raw.empty:
         return
-    hrow = source.header_row if source.header_row is not None else find_header_row(raw)
+    if source.header_row is not None:
+        hrow = source.header_row
+    else:
+        hrow = None
+        if source.projected:
+            hrow = find_anchored_header(
+                [raw.iloc[i].tolist() for i in range(min(25, len(raw)))],
+                source.anchor_columns)
+            if hrow is None:
+                raise WrongShape(
+                    f"{os.path.basename(path)}: none of the first 25 rows "
+                    f"contains the mapped columns {source.anchor_columns}")
+        if hrow is None:
+            hrow = find_header_row(raw)
     if hrow >= len(raw):
         return
     columns = normalize_columns(raw.iloc[hrow].tolist())
@@ -386,8 +477,18 @@ def read_excel(path: str, source: Source) -> Iterator[List[Dict[str, Any]]]:
 
 
 def read_csv(path: str, source: Source) -> Iterator[List[Dict[str, Any]]]:
-    skip = (source.header_row if source.header_row is not None
-            else detect_csv_header_row(path))
+    if source.header_row is not None:
+        skip = source.header_row
+    else:
+        skip = None
+        if source.projected:
+            skip = find_anchored_header(_first_lines(path, 25), source.anchor_columns)
+            if skip is None:
+                raise WrongShape(
+                    f"{os.path.basename(path)}: none of the first 25 lines "
+                    f"contains the mapped columns {source.anchor_columns}")
+        if skip is None:
+            skip = detect_csv_header_row(path)
     try:
         reader = pd.read_csv(
             path, skiprows=skip, dtype=object, chunksize=BATCH,
@@ -470,4 +571,9 @@ def read_file(path: str, source: Source, meta: dict) -> Iterator[List[Dict[str, 
 
             row["report_date"] = report_date
             row["date_grain"] = grain if report_date == file_date else "day"
+
+        if source.projected:
+            # Replace every row with its projection. Done last so the date
+            # logic above has already resolved file_date for FILENAME rules.
+            batch[:] = [project_row(r, source, meta, file_date) for r in batch]
         yield batch

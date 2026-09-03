@@ -188,6 +188,8 @@ def files_for(source: Source, index: dict) -> List[dict]:
         relative = "/".join(segments[1:])
         if any(x in relative for x in source.exclude):
             continue
+        if source.only and not any(x in relative for x in source.only):
+            continue
         out.append(f)
     return sorted(out, key=lambda f: (f["modified"], f["name"]))
 

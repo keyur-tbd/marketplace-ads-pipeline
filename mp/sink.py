@@ -111,7 +111,7 @@ def row_hash(payload: Dict[str, Any], occurrence: int) -> str:
 
 
 def to_db_row(row: Dict[str, Any], types: Dict[str, str],
-              occurrence: int = 0) -> Dict[str, Any]:
+              occurrence: int = 0, raw: bool = True) -> Dict[str, Any]:
     """Normalized row -> table row, coercing each column to its declared type.
 
     Nothing is dropped: the full normalized row goes into raw_data, so a column
@@ -138,8 +138,11 @@ def to_db_row(row: Dict[str, Any], types: Dict[str, str],
     # is still stored and queryable as raw_data->>'key' - at a fraction of the
     # size. NULL rather than '{}' when there is no overflow, which is the
     # common case, because a null costs a bit in the null bitmap and no more.
-    overflow = {k: v for k, v in row.items() if k not in types}
-    out["raw_data"] = overflow or None
+    if raw:
+        overflow = {k: v for k, v in row.items() if k not in types}
+        out["raw_data"] = overflow or None
+    # A projected source (raw=False) has no raw_data column at all: the
+    # requirement there is that only the named columns reach the database.
 
     # raw_data IS part of the identity now that it is overflow-only: two rows
     # differing solely in a column discovery has not typed yet are genuinely
@@ -150,7 +153,7 @@ def to_db_row(row: Dict[str, Any], types: Dict[str, str],
 
 
 def build_rows(rows: Sequence[Dict[str, Any]], types: Dict[str, str],
-               seen: Optional[Dict[str, int]] = None
+               seen: Optional[Dict[str, int]] = None, raw: bool = True
                ) -> Tuple[List[Dict[str, Any]], int]:
     """Convert a batch to table rows, numbering repeated identical lines.
 
@@ -172,13 +175,13 @@ def build_rows(rows: Sequence[Dict[str, Any]], types: Dict[str, str],
     out: List[Dict[str, Any]] = []
     repeats = 0
     for row in rows:
-        probe = to_db_row(row, types, 0)
+        probe = to_db_row(row, types, 0, raw)
         key = probe["row_hash"]
         n = seen.get(key, 0)
         seen[key] = n + 1
         if n:
             repeats += 1
-        out.append(probe if n == 0 else to_db_row(row, types, n))
+        out.append(probe if n == 0 else to_db_row(row, types, n, raw))
     return out, repeats
 
 
