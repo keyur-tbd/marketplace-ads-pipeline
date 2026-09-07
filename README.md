@@ -1,12 +1,17 @@
 # Market Place Data → Supabase
 
 Pushes the marketplace ads / offers / off-invoice data from the Google Drive
-folder **Market Place Data** into Supabase, so the platform portals never have
-to be integrated directly. The data keeps flowing into Drive exactly as it does
+folder **Market Place Data**, and the secondary sales from **New Power BI
+Format Daily Sales**, into Supabase, so the platform portals never have to be
+integrated directly. The data keeps flowing into Drive exactly as it does
 today; this pipeline picks it up from there.
 
-The folder **"Not to be uploaded in Supabase"** is never read — it is skipped at
-index time, so its files never even appear in the file list.
+Two Drive roots are walked (`ROOTS` in `mp/sources.py`), each with folder names
+that are skipped at index time so their files never even appear in the file
+list: under Market Place Data, **"Not to be uploaded in Supabase"** and the
+frozen **"5) Sales Raw Data"** copy; under the sales root, the **"2024"** year
+folders, **"Old Data"** and **"All Master"** (history and a SKU master that
+Power BI keeps but Supabase does not need).
 
 ## Order
 
@@ -18,6 +23,7 @@ Sources are processed in the sequence the numbered Drive folders give:
 | 2 | `2) Off Invoice Split Data` | Off-invoice, processed end file | `mp_off_invoice_split` |
 | 3 | `3) Ads Split Data` | Ads spend, processed end file | `mp_ads_split` |
 | 4 | `4) Ads Raw Data` | Raw platform exports, 6 platforms | 32 tables |
+| 5 | `New Power BI Format Daily Sales` (separate root) | Daily secondary sales, 10 platforms | `mp_sales` |
 
 Files with **"split"** in the name are the processed end files — they are the
 reporting layer. Everything under `4) Ads Raw Data` is the untouched platform
@@ -26,10 +32,22 @@ export, kept as the audit / drill-down layer.
 **Scootsy is Instamart.** The rename is applied to platform *values* inside the
 data, not just to folder names, via `PLATFORM_ALIASES` in `mp/sources.py`.
 
-### 5) Sales Raw Data — one table, six columns
+### 5) Sales — one table, six columns
+
+**Where it reads from.** The sales sources read the uploader's own Drive folder,
+**New Power BI Format Daily Sales**, laid out as
+`<platform>/[<report>/]<year>/<Mon-YY>/<file>`. That is the folder the person
+maintains for Power BI anyway, so nothing has to be copied into a second folder
+for Supabase. Until 2026-09-07 they read `Market Place Data/5) Sales Raw Data`,
+a hand-made copy of the same files; every one of the 2,630 files loaded from it
+was byte-identical to its Power BI original, so the cutover carried the
+`mp_loaded_files` ledger across (`seed_sales_ledger.py`) instead of re-reading
+anything. The old copy is frozen and excluded. The only sales the pipeline
+declines from that folder are the "2024" year folders, "Old Data" and
+"All Master" — see `ROOTS`.
 
 The sales folder is handled differently from the ads folders, on purpose. Rather
-than one table per report with every column discovered, all eight platforms
+than one table per report with every column discovered, all ten platforms
 land in **one table, `mp_sales`**, with exactly the columns named in
 `Sales Column Name for All Platform.xlsx`:
 
@@ -53,9 +71,9 @@ which is what lets Amazon Vendor Central's metadata row be skipped and makes a
 file with none of the mapped columns get reported as misfiled instead of loaded
 as nulls.
 
-Three "Power BI Upload" monthly rollups (BB, Flipkart, Amazon — Apr–Sep 2025,
-before the daily exports begin) are not in the spec and are mapped by analogy;
-see the `note` on each in `mp/sources.py`.
+Three "Power BI Upload" monthly rollups (BB, Flipkart, Amazon — the "Last Year
+Sales/2025" folders, covering the months before the daily exports begin) are not
+in the spec and are mapped by analogy; see the `note` on each in `mp/sources.py`.
 
 **No store column, by decision.** Only Instamart exports a store identifier
 (`store_id`, `area_name`); every other platform's finest geography is city
@@ -80,8 +98,9 @@ SUPABASE_SERVICE_ROLE_KEY=eyJhbGci...     # service role: bypasses RLS for write
 SUPABASE_LOG_TABLE=workflow_logs
 ```
 
-`token.json` is a Google OAuth token with the `drive` scope, for an account the
-Drive folder is shared with (currently `marketing@thebakersdozen.in`).
+`token.json` is a Google OAuth token with the `drive` scope, for an account
+**both** Drive roots are shared with (currently `marketing@thebakersdozen.in`;
+the sales root is owned by the uploader's account and shared to it).
 
 ## Usage
 
@@ -239,6 +258,13 @@ Found while loading; the pipeline copes with all of them, but they are real:
   appears to duplicate uploads.
 - **Excel serial dates.** One Amazon budget export writes part of its Date column
   as text (`Feb 2, 2025`) and part as raw serials (`45824`). Both are parsed.
+- **A 1-Sep export filed under August.** Sales root,
+  `Amazon PI/Grocery - Snacks Food/2026/Aug-26/ASIN_wise_Sales_..._01-09-2026 ... food.csv`
+  is the 1 September export under its raw portal name. Amazon PI dates rows from
+  columns inside the file, so it loads correctly and its rows collide with
+  `Sep-26/01-Sep-26.csv` on hash; still, it belongs in the September folder.
+- **First Club re-uploads.** 24, 25 and 26 Aug 2026 were replaced with different
+  content after the first load. Handled at cutover by reloading the platform.
 
 ## Layout
 
@@ -249,7 +275,9 @@ mp/readers.py    file -> normalized rows (the messy-format handling)
 mp/schema.py     samples files -> column types -> CREATE TABLE SQL
 mp/sink.py       Supabase: typed rows, row_hash, upsert, workflow_logs
 mp/pipeline.py   CLI
-index.json       cached Drive tree
+seed_sales_ledger.py  one-off: carried the mp_sales ledger over to the Power BI
+                 sales root on 2026-09-07 (kept for the audit trail)
+index.json       cached Drive tree (both roots)
 discovered.json  cached column types per table
 schema.sql       generated; paste into the Supabase SQL editor
 cache/           downloaded files (safe to delete)

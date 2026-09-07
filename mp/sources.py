@@ -15,7 +15,11 @@ data to be processed in the sequence the folder names give:
 is the untouched platform export. Both are loaded: the split tables are the
 reporting layer, the raw tables are the audit/drill-down layer.
 
-The folder "Not to be uploaded in Supabase" is never read - see EXCLUDE_PATH.
+Two Drive roots are walked (see ROOTS). The ads / offers / off-invoice sources
+live under "Market Place Data". The sales sources read the uploader's own
+"New Power BI Format Daily Sales" folder directly, so nobody has to copy files
+into a second folder for Supabase; the old "5) Sales Raw Data" copy is frozen
+and excluded. Per-root folder names in ROOTS are never read, at any depth.
 
 Columns are NOT hand-listed here. Headers vary between months and platforms
 change them without notice, so `discover.py` samples real files and derives the
@@ -27,14 +31,38 @@ report date comes from, and which numeric-looking columns must stay text.
 
 from typing import Dict, List, Optional, Sequence
 
-#: Never read anything under this folder, at any depth.
-EXCLUDE_PATH = "Not to be uploaded in Supabase"
-
-#: Drive folder id of "Market Place Data".
+#: Drive folder id of "Market Place Data" (ads, offers, off-invoice).
 ROOT_FOLDER_ID = "188ROEXBYrkMUybnrvJwlkLSxxLS_cl5e"
+
+#: Drive folder id of "New Power BI Format Daily Sales". This is the folder the
+#: uploader already maintains for Power BI; the sales sources read it directly.
+SALES_ROOT_FOLDER_ID = "1ylLL0RFDXBZA28ttErGsy8beLUClWnw-"
+
+#: Every root that is walked, with the folder NAMES that are skipped at index
+#: time under that root, at any depth (compared case-insensitively). A skipped
+#: folder's files never appear in the file list at all.
+#:
+#: Under the sales root the skipped folders are the history Power BI keeps that
+#: Supabase does not need: the "2024" year folders (monthly rollups from before
+#: the daily exports), "Old Data" (duplicate copies of the 2025 Amazon rollups)
+#: and "All Master" (a SKU master workbook, not sales).
+ROOTS: Dict[str, List[str]] = {
+    ROOT_FOLDER_ID: ["Not to be uploaded in Supabase",
+                     # Frozen copy of the sales folder; superseded by
+                     # SALES_ROOT_FOLDER_ID on 2026-09-07.
+                     "5) Sales Raw Data"],
+    SALES_ROOT_FOLDER_ID: ["2024", "Old Data", "All Master"],
+}
+
+
+def excluded_folders(root_id: str) -> List[str]:
+    return [x.lower() for x in ROOTS.get(root_id, [])]
+
 
 #: Files that are Windows/Drive noise rather than data.
 JUNK_NAMES = {"desktop.ini", ".ds_store", "thumbs.db"}
+#: ...and by extension: a stray Windows shortcut sits in BB Instant Nov-25.
+JUNK_SUFFIXES = (".lnk", ".ini", ".tmp")
 
 #: Platform aliases. The user's instruction: wherever a file says "Scootsy",
 #: it means Instamart. Applied to platform-bearing values, not just paths.
@@ -79,7 +107,8 @@ class Source:
     """One report type: where it lives in Drive and how to read it.
 
     table       Supabase table name.
-    folder      Drive path prefix, relative to "Market Place Data".
+    root        Drive folder id the source is read from (a key of ROOTS).
+    folder      Drive path prefix, relative to that root.
     sheet       Worksheet to read for spreadsheets. None -> first sheet.
                 A workbook with several meaningful sheets gets one Source per
                 sheet (Blinkit), so each lands in its own table.
@@ -119,10 +148,12 @@ class Source:
                  exclude: Sequence[str] = (),
                  note: str = "",
                  select: Optional[Dict[str, object]] = None,
-                 only: Sequence[str] = ()):
+                 only: Sequence[str] = (),
+                 root: str = ROOT_FOLDER_ID):
         self.key = key
         self.order = order
         self.table = table
+        self.root = root
         self.folder = folder
         self.platform = platform
         self.report = report
@@ -402,13 +433,16 @@ _ZEPTO: List[Source] = [
 # `platform` is the spec's own label ("BB Gamma Sales", "Instamart", ...) so the
 # table matches the spec exactly. Scootsy is Instamart, per the standing rule.
 
-_SALES = "5) Sales Raw Data"
 SALES_TABLE = "mp_sales"
 
 
 def _sales(key, order, folder, platform, report, select, **kw):
-    return Source(key, order, SALES_TABLE, f"{_SALES}/{folder}", platform,
-                  report, select=select, **kw)
+    """A sales source. Folders are relative to the Power BI sales root, whose
+    layout is <platform>/[<report>/]<year>/<Mon-YY>/<file>. The year folder
+    sits between the report folder and the files, which the ordered-subsequence
+    folder match in drive.files_for takes in its stride."""
+    return Source(key, order, SALES_TABLE, folder, platform, report,
+                  select=select, root=SALES_ROOT_FOLDER_ID, **kw)
 
 
 _SALES_SOURCES: List[Source] = [
@@ -427,16 +461,17 @@ _SALES_SOURCES: List[Source] = [
     # -- Amazon Vendor Central: daily workbooks with a metadata row above the
     #    header. The header anchors on 'asin', so that row is skipped. The spec
     #    lists no sub city for this platform.
-    _sales("sales_amazon_vendor", "5.2", "Amazon Vendore Portal",
+    _sales("sales_amazon_vendor", "5.2",
+           "Amazon Vendor Central/Amazon Daily Sales",
            "Amazon Vendor Central", "Vendor Central shipped units",
            {"sku_code": "asin", "sku_name": "product_title",
             "sale_date": FILENAME, "qty": "shipped_units"},
-           exclude=["Power BI Upload"],
-           note="Folder is misspelled 'Vendore' in Drive; kept verbatim."),
-    # The 'Power BI Upload' monthly files in that folder are a different
-    # report (ordered units by city). Not in the spec; mapped by analogy so
-    # the Apr-25 to Sep-25 history is not lost. CONFIRM this mapping.
-    _sales("sales_amazon_vendor_powerbi", "5.2", "Amazon Vendore Portal",
+           exclude=["Power BI Upload"]),
+    # The 'Power BI Upload' monthly files are a different report (ordered
+    # units by city). Not in the spec; mapped by analogy so the 2025 history
+    # before the daily exports is not lost. CONFIRM this mapping.
+    _sales("sales_amazon_vendor_powerbi", "5.2",
+           "Amazon Vendor Central/Amazon Last Year Sales",
            "Amazon Vendor Central", "Vendor Central monthly (Power BI upload)",
            {"sku_code": "asin", "sku_name": "item_name",
             "sale_date": "order_day", "qty": "finla_qty", "sub_city": "city"},
@@ -458,7 +493,7 @@ _SALES_SOURCES: List[Source] = [
            "BB Instant Sales", "BB instant sales",
            {"sku_code": "source_sku_id", "sku_name": "sku_description",
             "sale_date": FILENAME, "qty": "quantity", "sub_city": "location_city"}),
-    _sales("sales_bb_powerbi", "5.3", "Big Basket/BB Apr-25 To Sep-25 Data",
+    _sales("sales_bb_powerbi", "5.3", "Big Basket/BB Last Year Sales",
            "BB Daily", "BB monthly (Power BI upload), Apr-Sep 25",
            {"sku_code": "sku", "sku_name": "product_name", "sale_date": "date",
             "qty": "quantity", "sub_city": "sub_city"},
@@ -476,7 +511,7 @@ _SALES_SOURCES: List[Source] = [
            {"sku_code": "sku_code", "sku_name": "sku_name", "sale_date": FILENAME,
             "qty": "quantity", "sub_city": "city"}),
     _sales("sales_flipkart_powerbi", "5.5",
-           "Flipkart/Flipkart Apr-25 To Sep-25 Data",
+           "Flipkart/Flipkart Last year Sales",
            "Flipkart", "Flipkart monthly (Power BI upload), Apr-Sep 25",
            {"sku_code": "sku_code", "sale_date": "date", "qty": "quantity",
             "sub_city": "city"},

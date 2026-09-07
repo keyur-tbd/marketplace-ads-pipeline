@@ -24,7 +24,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-from .sources import EXCLUDE_PATH, JUNK_NAMES, ROOT_FOLDER_ID, Source
+from .sources import (JUNK_NAMES, JUNK_SUFFIXES, ROOT_FOLDER_ID, ROOTS, Source,
+                      excluded_folders)
 
 logger = logging.getLogger("mp.drive")
 
@@ -107,32 +108,47 @@ def _list_children(svc, folder_id: str) -> List[dict]:
             return out
 
 
-def build_index(svc, root_id: str = ROOT_FOLDER_ID) -> dict:
-    """Walk the whole tree once. Skips the excluded folder entirely."""
+def is_junk(name: str) -> bool:
+    low = name.lower()
+    return low in JUNK_NAMES or low.endswith(JUNK_SUFFIXES)
+
+
+def build_index(svc, roots: Optional[Dict[str, List[str]]] = None) -> dict:
+    """Walk every root once. A root's excluded folders are never entered, so
+    their files do not appear in the index at all."""
+    roots = roots if roots is not None else ROOTS
     files: List[dict] = []
     folders: List[dict] = []
+    walked: List[dict] = []
 
-    def walk(fid: str, path: str, depth: int):
-        folders.append({"id": fid, "path": path, "depth": depth})
+    def walk(root_id: str, skip: set, fid: str, path: str, depth: int):
+        folders.append({"id": fid, "path": path, "depth": depth,
+                        "root_id": root_id})
         for f in _list_children(svc, fid):
             child = f"{path}/{f['name']}"
             if f["mimeType"] == FOLDER_MIME:
-                if f["name"] == EXCLUDE_PATH:
+                if f["name"].lower() in skip:
                     logger.info("[INDEX] skipping excluded folder: %s", child)
                     continue
-                walk(f["id"], child, depth + 1)
-            elif f["name"].lower() not in JUNK_NAMES:
+                walk(root_id, skip, f["id"], child, depth + 1)
+            elif not is_junk(f["name"]):
                 files.append({
                     "id": f["id"], "name": f["name"], "path": child,
                     "mime": f["mimeType"], "size": int(f.get("size") or 0),
                     "modified": f.get("modifiedTime", ""),
+                    "root_id": root_id,
                 })
 
-    root = svc.files().get(fileId=root_id, fields="name",
-                           supportsAllDrives=True).execute()
-    logger.info("[INDEX] walking '%s' ...", root["name"])
-    walk(root_id, root["name"], 0)
-    index = {"root": root["name"], "root_id": root_id,
+    for root_id, skip_names in roots.items():
+        root = svc.files().get(fileId=root_id, fields="name",
+                               supportsAllDrives=True).execute()
+        logger.info("[INDEX] walking '%s' ...", root["name"])
+        walk(root_id, {x.lower() for x in skip_names}, root_id, root["name"], 0)
+        walked.append({"id": root_id, "name": root["name"]})
+
+    # "root"/"root_id" name the first root, for anything that still expects
+    # a single one; "roots" is the full list.
+    index = {"roots": walked, "root": walked[0]["name"], "root_id": walked[0]["id"],
              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "folders": folders, "files": files}
     with open(INDEX_FILE, "w", encoding="utf-8") as fh:
@@ -173,16 +189,20 @@ def _is_subsequence(folder_segments: List[str], path_segments: List[str]) -> boo
 
 def files_for(source: Source, index: dict) -> List[dict]:
     """Every data file belonging to `source`, oldest first."""
-    root = index["root"]
+    # An index built before roots were recorded per file holds only the
+    # first root; treat its files as belonging to it.
+    legacy_root = index.get("root_id")
+    skip = set(excluded_folders(source.root))
     wanted = source.folder.split("/")
     out = []
     for f in index["files"]:
-        if EXCLUDE_PATH in f["path"]:
+        if f.get("root_id", legacy_root) != source.root:
             continue
         segments = f["path"].split("/")
-        if not segments or segments[0] != root:
-            continue
         directories = segments[1:-1]          # drop the root and the file name
+        # Excluded folders never reach the index; this guards a stale one.
+        if any(d.lower() in skip for d in directories):
+            continue
         if not _is_subsequence(wanted, directories):
             continue
         relative = "/".join(segments[1:])

@@ -5,8 +5,10 @@ Sources are processed in the numbered order the Drive folders give:
 
     1) Discount Split Data     2) Off Invoice Split Data
     3) Ads Split Data          4) Ads Raw Data (per platform)
+    5) Sales -> read straight from "New Power BI Format Daily Sales"
 
-The "Not to be uploaded in Supabase" folder is never read.
+Folders listed in sources.ROOTS (e.g. "Not to be uploaded in Supabase", the
+"2024" history under the sales root) are never read.
 
 Run these in order the first time:
 
@@ -93,7 +95,8 @@ def cmd_index(refresh: bool) -> int:
         for f in drive.files_for(s, index):
             counts[s.key] += 1
             size[s.key] += f["size"]
-    print(f"\nindex built {index.get('built_at')} - "
+    roots = ", ".join(r["name"] for r in index.get("roots", [])) or index.get("root")
+    print(f"\nindex built {index.get('built_at')} from [{roots}] - "
           f"{len(index['folders'])} folders, {len(index['files'])} files\n")
     print(f"{'ORDER':6} {'KEY':28} {'FILES':>6} {'MB':>9}")
     total_f = total_b = 0
@@ -210,12 +213,13 @@ def cmd_check() -> int:
               "in the Supabase SQL editor.", file=sys.stderr)
 
     try:
-        drive.build_service().files().get(
-            fileId=drive.ROOT_FOLDER_ID, fields="name",
-            supportsAllDrives=True).execute()
-        print("\nDrive: root folder reachable")
+        svc = drive.build_service()
+        for root_id in drive.ROOTS:
+            name = svc.files().get(fileId=root_id, fields="name",
+                                   supportsAllDrives=True).execute()["name"]
+            print(f"\nDrive: root folder reachable - {name}")
     except Exception as exc:  # noqa: BLE001
-        print(f"\nDrive: NOT reachable - {exc}", file=sys.stderr)
+        print(f"\nDrive: root {root_id} NOT reachable - {exc}", file=sys.stderr)
         ok = False
     return 0 if ok else 1
 
