@@ -15,11 +15,18 @@ data to be processed in the sequence the folder names give:
 is the untouched platform export. Both are loaded: the split tables are the
 reporting layer, the raw tables are the audit/drill-down layer.
 
-Two Drive roots are walked (see ROOTS). The ads / offers / off-invoice sources
-live under "Market Place Data". The sales sources read the uploader's own
-"New Power BI Format Daily Sales" folder directly, so nobody has to copy files
-into a second folder for Supabase; the old "5) Sales Raw Data" copy is frozen
-and excluded. Per-root folder names in ROOTS are never read, at any depth.
+Three Drive roots are walked (see ROOTS), because the uploaders maintain three
+folders and the pipeline reads each where it actually lives rather than asking
+anyone to copy files into a fourth:
+
+    "Market Place Data"               the 1)-3) split files
+    "Visibility Data"                 the 4) raw per-platform ads exports
+    "New Power BI Format Daily Sales" the 5) sales exports
+
+Both of the copies that used to sit under "Market Place Data" are now frozen and
+excluded: "5) Sales Raw Data" (superseded 2026-09-07) and "4) Ads Raw Data"
+(superseded 2026-09-09). Per-root folder names in ROOTS are never read, at any
+depth.
 
 Columns are NOT hand-listed here. Headers vary between months and platforms
 change them without notice, so `discover.py` samples real files and derives the
@@ -31,8 +38,22 @@ report date comes from, and which numeric-looking columns must stay text.
 
 from typing import Dict, List, Optional, Sequence
 
-#: Drive folder id of "Market Place Data" (ads, offers, off-invoice).
+#: Drive folder id of "Market Place Data" (offers, off-invoice, ads splits).
 ROOT_FOLDER_ID = "188ROEXBYrkMUybnrvJwlkLSxxLS_cl5e"
+
+#: Drive folder id of "Visibility Data": the raw per-platform ads exports.
+#:
+#: Superseded "Market Place Data/4) Ads Raw Data" on 2026-09-09. That folder is
+#: a frozen copy - the uploaders now file everything here - so it is excluded
+#: below and the raw sources read this root instead. The tree is reorganised,
+#: not renamed: platform folders sit at the top and each platform's report
+#: folders moved a level (Amazon "Amazon Visibility Data" -> "Visibility MoM
+#: Data", Big Basket "BB Visibility Data" -> "New Data", Flipkart -> "Flipkart
+#: Minutes", Zepto's flat folder -> KBA/PCA/PDA sub-folders). The folder strings
+#: below name only the platform and the report, letting the ordered-subsequence
+#: match in drive.files_for absorb the section folder in between - so a future
+#: reshuffle of that middle level does not silently empty a source.
+ADS_ROOT_FOLDER_ID = "12L2s5XewGLIuqHOPbV7uYbPvYIUWIvof"
 
 #: Drive folder id of "New Power BI Format Daily Sales". This is the folder the
 #: uploader already maintains for Power BI; the sales sources read it directly.
@@ -50,7 +71,13 @@ ROOTS: Dict[str, List[str]] = {
     ROOT_FOLDER_ID: ["Not to be uploaded in Supabase",
                      # Frozen copy of the sales folder; superseded by
                      # SALES_ROOT_FOLDER_ID on 2026-09-07.
-                     "5) Sales Raw Data"],
+                     "5) Sales Raw Data",
+                     # Frozen copy of the raw ads exports; superseded by
+                     # ADS_ROOT_FOLDER_ID on 2026-09-09. Excluding it keeps
+                     # 3,429 dead files out of the index and makes it
+                     # impossible for a raw source to read both roots.
+                     "4) Ads Raw Data"],
+    ADS_ROOT_FOLDER_ID: [],
     SALES_ROOT_FOLDER_ID: ["2024", "Old Data", "All Master"],
 }
 
@@ -266,65 +293,64 @@ _SPLIT: List[Source] = [
 ]
 
 # --------------------------------------------------------------------------- #
-# 4: raw platform exports, by platform.                                        #
+# 4: raw platform exports, by platform. Read from ADS_ROOT_FOLDER_ID, so the    #
+#    folders below are relative to "Visibility Data", not "Market Place Data".  #
 # --------------------------------------------------------------------------- #
-
-_RAW = "4) Ads Raw Data"
 
 _AMAZON: List[Source] = [
     Source("amz_advertised_product", "4.1", "amz_sp_advertised_product",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Advertised Product",
+           "Amazon/SP Advertised Product",
            "AMAZON", "SP advertised product", date_columns=["date"]),
     Source("amz_budget", "4.1", "amz_sp_budget_report",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Buduget Report",
+           "Amazon/SP Buduget Report",
            "AMAZON", "SP budget", date_columns=["date", "start_date", "end_date"],
            note="Folder name is misspelled in Drive ('Buduget'); kept verbatim "
                 "so the path matches."),
     Source("amz_campaign", "4.1", "amz_sp_campaign_report",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Campaign Report",
+           "Amazon/SP Campaign Report",
            "AMAZON", "SP campaign", date_columns=["start_date", "end_date"],
            note="Has no single Date column - the range is Start/End Date, and "
                 "report_date takes Start Date."),
     Source("amz_campaign_daily", "4.1", "amz_sp_campaign_daily",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Campaign report Daily",
+           "Amazon/SP Campaign report Daily",
            "AMAZON", "SP campaign daily", date_columns=["date"]),
     Source("amz_placement", "4.1", "amz_sp_placement_report",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Placement Report",
+           "Amazon/SP Placement Report",
            "AMAZON", "SP placement", date_columns=["date"]),
     Source("amz_search_term", "4.1", "amz_sp_search_term_report",
-           f"{_RAW}/Amazon/Amazon Visibility Data/SP Search Term Report",
+           "Amazon/SP Search Term Report",
            "AMAZON", "SP search term", date_columns=["date"]),
     Source("amz_search_term_impression", "4.1", "amz_search_term_impression",
-           f"{_RAW}/Amazon/Amazon Visibility Data/Search term Impression",
+           "Amazon/Search term Impression",
            "AMAZON", "Search term impression share", date_columns=["date"]),
     Source("amz_kw_type", "4.1", "amz_keyword_type_master",
-           f"{_RAW}/Amazon/Amazon Visibility Data/Master",
+           "Amazon/Master",
            "AMAZON", "Keyword type master", sheet="Export", header_row=1,
            note="Row 0 is a stray 'Month' label above the real header."),
 ]
 
 _BIGBASKET: List[Source] = [
     Source("bb_auction", "4.2", "bb_auction_level",
-           f"{_RAW}/Big Basket/BB Visibility Data/Auction Level Report",
+           "Big Basket/Auction Level Report",
            "BIGBASKET", "Auction booking performance",
            sheet="Auction Booking Perf Report",
            date_columns=["date", "flight_start_date", "flight_end_date"]),
     Source("bb_campaign", "4.2", "bb_campaign_level",
-           f"{_RAW}/Big Basket/BB Visibility Data/Campaign Level Data",
+           "Big Basket/Campaign Level Data",
            "BIGBASKET", "Campaign performance",
            sheet="Campaign Performance Report", date_from_filename=True,
            date_columns=["campaign_creation_date"],
            note="No date inside the file - the file name (08-Aug-26.xlsx) is "
                 "the report date."),
     Source("bb_campaign_awareness", "4.2", "bb_campaign_level_awareness",
-           f"{_RAW}/Big Basket/BB Visibility Data/Campaign Level Data Awareness",
+           "Big Basket/Campaign Level Data Awareness",
            "BIGBASKET", "Campaign performance (awareness)",
            sheet="Campaign Performance Report", date_from_filename=True,
            date_columns=["campaign_creation_date", "campaign_end_date"],
            note="Same sheet name as Campaign Level Data but a different column "
                 "set, so it gets its own table."),
     Source("bb_shopper_search", "4.2", "bb_shopper_level_search",
-           f"{_RAW}/Big Basket/BB Visibility Data/Shopper Level Search",
+           "Big Basket/Shopper Level Search",
            "BIGBASKET", "Search query performance",
            sheet="Search Query Performance Report", date_from_filename=True),
 ]
@@ -353,7 +379,7 @@ _BLINKIT_VISIBILITY_SHEETS = [
 
 _BLINKIT: List[Source] = [
     Source(f"blinkit_dur_{k}", "4.3", table,
-           f"{_RAW}/Blinkit/Blinkit Campaign Duration Data",
+           "Blinkit/Campaign Duration Data",
            "BLINKIT", f"Campaign duration - {sheet}",
            sheet=sheet,
            date_from_filename=month_only,
@@ -364,7 +390,7 @@ _BLINKIT: List[Source] = [
     for k, sheet, table, month_only in _BLINKIT_DURATION_SHEETS
 ] + [
     Source(f"blinkit_vis_{k}", "4.3", table,
-           f"{_RAW}/Blinkit/Blinkit Visibility Data",
+           "Blinkit/Product Listing",
            "BLINKIT", f"Visibility - {sheet}",
            sheet=sheet, date_columns=["date"])
     for k, sheet, table in _BLINKIT_VISIBILITY_SHEETS
@@ -377,17 +403,17 @@ for _prog in ("PCA", "PLA"):
     _lp = _prog.lower()
     _FLIPKART += [
         Source(f"fk_{_lp}_consolidated", "4.4", f"fk_{_lp}_consolidated_fsn",
-               f"{_RAW}/Flipkart/Flipkart Visibility Data/{_prog}/"
+               f"Flipkart Minutes/{_prog}/"
                "Monthly - Consolidated FSN report",
                "FLIPKART", f"{_prog} consolidated FSN",
                date_from_filename=True, date_columns=["date"]),
         Source(f"fk_{_lp}_keyword", "4.4", f"fk_{_lp}_keyword",
-               f"{_RAW}/Flipkart/Flipkart Visibility Data/{_prog}/"
+               f"Flipkart Minutes/{_prog}/"
                "Monthly - Keyword wise Format",
                "FLIPKART", f"{_prog} keyword wise",
                date_from_filename=True, date_columns=["date"]),
         Source(f"fk_{_lp}_placement", "4.4", f"fk_{_lp}_placement",
-               f"{_RAW}/Flipkart/Flipkart Visibility Data/{_prog}/"
+               f"Flipkart Minutes/{_prog}/"
                "Monthly - Placement report",
                "FLIPKART", f"{_prog} placement",
                date_from_filename=True, date_columns=["date"]),
@@ -405,21 +431,35 @@ for _prog in ("PCA", "PLA"):
 
 _INSTAMART: List[Source] = [
     Source("instamart_visibility", "4.5", "instamart_ads_performance",
-           f"{_RAW}/Instamart/Instamart Visibility Data",
+           "Instamart",
            "INSTAMART", "Campaign/keyword performance",
            date_columns=["metrics_date", "start_date", "end_date"],
+           exclude=["Timing"],
            note="Largest source by far (~3.5 GB of monthly CSVs). Streamed in "
-                "chunks rather than read whole."),
+                "chunks rather than read whole. The visibility exports sit in "
+                "two sibling folders ('Visibility' and 'Old Visibility data') "
+                "with no shared segment to match on, so this names the platform "
+                "folder and excludes 'Timing' - a separate report type "
+                "(225 files, no table) that would otherwise be swept in."),
 ]
 
 _ZEPTO: List[Source] = [
     Source("zepto_visibility", "4.6", "zepto_campaign_performance",
-           f"{_RAW}/Zepto/Zepto Visibility Data",
+           "Zepto/Daily x Visibility MoM Data",
            "ZEPTO", "Campaign performance", sheet="Sheet1",
            date_from_filename=True,
+           exclude=["Campaign wise MoM Data", "Exhaust Time Report"],
            note="~1073 one-day workbooks with no date column; the file name "
-                "(19-Jan-26.xlsx) is the report date."),
+                "(19-Jan-26.xlsx) is the report date. The one flat folder is "
+                "now split into KBA/PCA/PDA Raw Files, which the subsequence "
+                "match takes in its stride; the two excluded siblings are "
+                "different report shapes that were never loaded."),
 ]
+
+# Every raw source above reads the "Visibility Data" root rather than "Market
+# Place Data". Set in one place, so a source cannot be added with the wrong one.
+for _s in _AMAZON + _BIGBASKET + _BLINKIT + _FLIPKART + _INSTAMART + _ZEPTO:
+    _s.root = ADS_ROOT_FOLDER_ID
 
 # --------------------------------------------------------------------------- #
 # 5: Sales raw exports -> ONE table, six columns, per the spec workbook.       #

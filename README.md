@@ -1,17 +1,23 @@
 # Market Place Data → Supabase
 
-Pushes the marketplace ads / offers / off-invoice data from the Google Drive
-folder **Market Place Data**, and the secondary sales from **New Power BI
-Format Daily Sales**, into Supabase, so the platform portals never have to be
-integrated directly. The data keeps flowing into Drive exactly as it does
-today; this pipeline picks it up from there.
+Pushes the marketplace offers / off-invoice / ads-spend splits from the Google
+Drive folder **Market Place Data**, the raw per-platform ads exports from
+**Visibility Data**, and the secondary sales from **New Power BI Format Daily
+Sales**, into Supabase, so the platform portals never have to be integrated
+directly. The data keeps flowing into Drive exactly as it does today; this
+pipeline picks it up from there.
 
-Two Drive roots are walked (`ROOTS` in `mp/sources.py`), each with folder names
-that are skipped at index time so their files never even appear in the file
-list: under Market Place Data, **"Not to be uploaded in Supabase"** and the
-frozen **"5) Sales Raw Data"** copy; under the sales root, the **"2024"** year
-folders, **"Old Data"** and **"All Master"** (history and a SKU master that
-Power BI keeps but Supabase does not need).
+Three Drive roots are walked (`ROOTS` in `mp/sources.py`), each with folder
+names that are skipped at index time so their files never even appear in the
+file list: under Market Place Data, **"Not to be uploaded in Supabase"** and the
+two frozen copies, **"5) Sales Raw Data"** and **"4) Ads Raw Data"**; under the
+sales root, the **"2024"** year folders, **"Old Data"** and **"All Master"**
+(history and a SKU master that Power BI keeps but Supabase does not need). The
+Visibility Data root excludes nothing.
+
+Each root reads where the uploaders actually file the data, rather than asking
+anyone to maintain a copy for Supabase. Both copies that used to sit under
+Market Place Data are now frozen: sales on 2026-09-07, raw ads on 2026-09-09.
 
 ## Order
 
@@ -22,12 +28,39 @@ Sources are processed in the sequence the numbered Drive folders give:
 | 1 | `1) Discount Split Data` | Offers/discount, processed end file | `mp_discount_split` |
 | 2 | `2) Off Invoice Split Data` | Off-invoice, processed end file | `mp_off_invoice_split` |
 | 3 | `3) Ads Split Data` | Ads spend, processed end file | `mp_ads_split` |
-| 4 | `4) Ads Raw Data` | Raw platform exports, 6 platforms | 32 tables |
+| 4 | `Visibility Data` (separate root) | Raw platform exports, 6 platforms | 32 tables |
 | 5 | `New Power BI Format Daily Sales` (separate root) | Daily secondary sales, 10 platforms | `mp_sales` |
 
 Files with **"split"** in the name are the processed end files — they are the
-reporting layer. Everything under `4) Ads Raw Data` is the untouched platform
+reporting layer. Everything under `Visibility Data` is the untouched platform
 export, kept as the audit / drill-down layer.
+
+### 4) Raw ads — the 2026-09-09 folder move
+
+The raw exports moved from `Market Place Data/4) Ads Raw Data` to the uploaders'
+own **Visibility Data** folder. The tree was reorganised, not just renamed:
+platform folders sit at the top, and each platform's section folder changed
+(`Amazon Visibility Data` → `Visibility MoM Data`, `BB Visibility Data` →
+`New Data`, `Flipkart` → `Flipkart Minutes`, and Zepto's one flat folder split
+into `KBA / PCA / PDA Raw Files`). The source folders in `mp/sources.py` name
+only the **platform and the report**, letting the ordered-subsequence match in
+`drive.files_for` absorb whatever section folder sits in between — so the next
+reshuffle of that middle level does not silently empty a source.
+
+The new folder is a **copy**: not one of its 4,129 files shares a Drive id with
+the old ones, though 3,416 are byte-identical to files already loaded. Since the
+ledger keys on Drive file id, `seed_ads_ledger.py` carried it across on
+(source, name, byte size) — 3,558 rows — exactly as the sales cutover did. Note
+this was belt-and-braces rather than a correctness fix: `row_hash` excludes
+provenance, so re-reading the copies would have collapsed onto the same rows
+anyway. What seeding avoided was days of re-downloading (~3.5 GB of Instamart
+alone) that could not finish inside a 330-minute job.
+
+Report types in the new folder that no source claims, and that were never loaded
+from the old one: `Big Basket/New Data/Keyword Level Data` (166 files),
+`Instamart/Timing` (225), `Blinkit/Daily x Visibility MoM Data/Display Assets`
+(8), `Zepto/…/Campaign wise MoM Data` (37) and `Exhaust Time Report` (1). Each
+would need its own table and a `--discover` pass; none is a regression.
 
 **Scootsy is Instamart.** The rename is applied to platform *values* inside the
 data, not just to folder names, via `PLATFORM_ALIASES` in `mp/sources.py`.
@@ -99,8 +132,11 @@ SUPABASE_LOG_TABLE=workflow_logs
 ```
 
 `token.json` is a Google OAuth token with the `drive` scope, for an account
-**both** Drive roots are shared with (currently `marketing@thebakersdozen.in`;
-the sales root is owned by the uploader's account and shared to it).
+**all three** Drive roots are shared with (currently
+`marketing@thebakersdozen.in`; the sales and Visibility Data roots are owned by
+the uploaders' accounts and shared to it). A root that is not shared with this
+account fails as a Drive **404, not a 403** — "no permission" and "no such
+folder" are indistinguishable, so check sharing first when a root goes missing.
 
 ## Usage
 
@@ -277,7 +313,7 @@ mp/sink.py       Supabase: typed rows, row_hash, upsert, workflow_logs
 mp/pipeline.py   CLI
 seed_sales_ledger.py  one-off: carried the mp_sales ledger over to the Power BI
                  sales root on 2026-09-07 (kept for the audit trail)
-index.json       cached Drive tree (both roots)
+index.json       cached Drive tree (all three roots)
 discovered.json  cached column types per table
 schema.sql       generated; paste into the Supabase SQL editor
 cache/           downloaded files (safe to delete)
