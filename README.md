@@ -97,8 +97,23 @@ workbook into five tables, so a file loaded for one of them looked done for all
 five, and three sources got no tombstones at all. Their August files then loaded:
 25,493 rows across `blinkit_vis_product_listing`, `_product_recommendation` and
 `_product_shelf` (`Aug-26.xls`, `31-Aug-26.xls`). Fixed; the lookup is now keyed
-on the pair. Note `Aug-26.xls` in the new folder is not the same file as the old
-root's - 40 rows against 36 - so it is a revised export, not a duplicate.
+on the pair.
+
+That left two August exports in those three tables. The new folder's
+`Aug-26.xls` is not the old root's file: it covers **Aug 1-30** where the old
+one covered only **Aug 17-26**, with revised metrics. `row_hash` collapses only
+byte-identical rows, so both survived and any August total double-counted the
+overlapping window - 15,572 campaign-days in `product_listing` alone, 14,767 of
+them with different numbers. Resolved on 2026-09-09 by deleting the **older,
+partial** export (2,781 rows, `drive_file_id 1Z1r6jKz...`) and keeping the
+complete one. `blinkit_vis_masthead` and `_banner_listing` had no rows from the
+old workbook at all, so they were left alone. August now reads as one export per
+table: Aug 1-30 plus `31-Aug-26.xls` for Aug 31, with no campaign-day sourced
+from two files.
+
+The old file's `mp_loaded_files` rows were deliberately **kept**. Its folder is
+frozen and excluded, so they are inert - but if `4) Ads Raw Data` is ever
+un-excluded, the ledger is what stops that partial export loading back in.
 
 The second is inherent to a one-shot tombstone: files uploaded to Drive between
 the tombstone and the run were never candidates. `llam4n3id2.csv` arrived that
