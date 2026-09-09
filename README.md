@@ -62,6 +62,38 @@ from the old one: `Big Basket/New Data/Keyword Level Data` (166 files),
 (8), `Zepto/…/Campaign wise MoM Data` (37) and `Exhaust Time Report` (1). Each
 would need its own table and a `--discover` pass; none is a regression.
 
+
+### The September 2026 cutoff
+
+"Visibility Data" holds much more than `4) Ads Raw Data` ever did — archive
+folders the uploaders keep (`Amazon/Old Data`, `Instamart/Old Visibility data`,
+`Zepto/…/Nov-24 To Aug-25 Files`), months that were never loaded, and a few
+master workbooks. After the cutover all of it read as "never loaded". The
+decision on 2026-09-09 was that **only data from September 2026 onward loads**;
+everything older stays in Drive.
+
+`--since` cannot express that alone. It keeps any file whose name carries no
+parseable date, on purpose — dropping those would lose the bulk back-history
+files that legitimately have range names. Here those are precisely what must not
+load (`2023 & 2025.csv`, `Zepto_Master.xlsx`, `01-May To 28-May-26.csv`). So the
+cutoff was applied to the ledger instead: `tombstone_pre_sep26_ads.py` wrote 77
+`mp_loaded_files` rows with `rows_written = 0`, one per pending file that could
+not prove it was from September 2026 or later.
+
+Tombstones were preferred over putting `--since` on the cron, which would also
+silently ignore a late correction to an August file forever. The workflow
+therefore carries no cutoff flag: anything genuinely new still loads normally.
+
+`tombstone_pre_sep26_ads.py` is a **cutover tool, not pipeline logic** — running
+it again would tombstone any new undated file, which is wrong outside this one
+migration.
+
+One consequence to know when reading the tables: the 36 historical
+`Amazon/Old Data/Search term Impression` files had already loaded (184,742 rows
+into `amz_search_term_impression`) before the cutoff was set, and were left in
+place deliberately rather than deleted. That table therefore carries back-history
+its siblings do not.
+
 **Scootsy is Instamart.** The rename is applied to platform *values* inside the
 data, not just to folder names, via `PLATFORM_ALIASES` in `mp/sources.py`.
 
