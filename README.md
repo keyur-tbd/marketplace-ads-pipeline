@@ -88,6 +88,23 @@ therefore carries no cutoff flag: anything genuinely new still loads normally.
 it again would tombstone any new undated file, which is wrong outside this one
 migration.
 
+Two things the cutover got wrong, recorded so the tables can be read honestly:
+
+The first pass of `tombstone_pre_sep26_ads.py` keyed "already loaded" on
+`drive_file_id` alone, but `mp_loaded_files` is keyed on
+**(table_name, drive_file_id)**. The five `blinkit_vis_*` sources read one
+workbook into five tables, so a file loaded for one of them looked done for all
+five, and three sources got no tombstones at all. Their August files then loaded:
+25,493 rows across `blinkit_vis_product_listing`, `_product_recommendation` and
+`_product_shelf` (`Aug-26.xls`, `31-Aug-26.xls`). Fixed; the lookup is now keyed
+on the pair. Note `Aug-26.xls` in the new folder is not the same file as the old
+root's - 40 rows against 36 - so it is a revised export, not a duplicate.
+
+The second is inherent to a one-shot tombstone: files uploaded to Drive between
+the tombstone and the run were never candidates. `llam4n3id2.csv` arrived that
+way and loaded 29 rows into `fk_pca_placement`; its name carries no date, so
+what period it covers is unknown.
+
 One consequence to know when reading the tables: the 36 historical
 `Amazon/Old Data/Search term Impression` files had already loaded (184,742 rows
 into `amz_search_term_impression`) before the cutoff was set, and were left in

@@ -74,8 +74,11 @@ def main(argv=None) -> int:
 
     conn = connect()
     cur = conn.cursor()
-    cur.execute("select drive_file_id from mp_loaded_files")
-    done = {r[0] for r in cur.fetchall()}
+    # Keyed on (table, file), exactly as mp_loaded_files is. Keying on the file
+    # alone is wrong: the five blinkit_vis_* sources read one workbook into five
+    # tables, so a file loaded for one of them would look done for all five.
+    cur.execute("select table_name, drive_file_id from mp_loaded_files")
+    done = {(r[0], r[1]) for r in cur.fetchall()}
 
     rows, keep = [], []
     by_folder = Counter()
@@ -84,7 +87,7 @@ def main(argv=None) -> int:
         if s.root != ADS_ROOT_FOLDER_ID:
             continue
         for f in drive.files_for(s, index):
-            if f["id"] in done:
+            if (s.table, f["id"]) in done:
                 continue
             if wanted(f["name"]):
                 per_source[s.key][1] += 1
