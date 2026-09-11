@@ -340,6 +340,30 @@ does not fit in a job (6h ceiling). Backfill once from a workstation, then let
 the workflow keep it current. The workflow never passes `--reload` for the same
 reason.
 
+### The P&L sheets (`mp.sheets`, `sheet-sync.yml`)
+
+Two Google Sheets are not Drive files to download but live tables the P&L is
+keyed on, so they have their own module and workflow:
+
+| Source key | Sheet | Tables |
+|---|---|---|
+| `campaign_master` | Ecom Campaign Master (`1oDQXCOi…DA94cI`, owned by instamart@) | `ref_ads_campaign`, `ref_ads_name_map` |
+| `pnl_feeder` | P&L Feeder File (`1NScaI-Y…WSjSY`) | the seven `pnl_*` cost tables |
+
+```
+python -m mp.sheets --check                      # parse, write nothing
+python -m mp.sheets --run                        # load whatever changed
+python -m mp.sheets --run --source pnl_feeder --force
+```
+
+Incremental: a sheet whose Drive `modifiedTime` has not moved since its last load
+is skipped (`public.sheet_sync_state` holds it, with what the last load inserted
+and updated), and a changed sheet only writes rows whose values differ. Nothing
+is deleted -- a campaign removed from the sheet keeps its mapping so its past
+spend keeps its product. The workflow runs at 08:30 and 17:30 IST, half an hour
+before each `o2c_refresh()` beat re-keys the P&L (Birbal migrations 066-068).
+Needs `GOOGLE_TOKEN_JSON` (with the spreadsheets scope) and the `PG*` secrets.
+
 ## Source data worth fixing in Drive
 
 Found while loading; the pipeline copes with all of them, but they are real:

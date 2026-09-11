@@ -1,0 +1,64 @@
+name: P&L sheets -> Supabase
+
+# The two Google Sheets the management P&L is keyed on, synced incrementally
+# (python -m mp.sheets, see its docstring):
+#
+#   campaign_master  Ecom Campaign Master -> ref_ads_campaign, ref_ads_name_map
+#   pnl_feeder       P&L Feeder File      -> the seven pnl_* cost tables
+#
+# A sheet whose Drive modifiedTime has not moved since its last load is skipped,
+# and a changed one only writes the rows whose values changed; nothing is
+# deleted. Timed half an hour before each public.o2c_refresh() beat
+# (keyur-tbd/bc-supabase-sync, 09:00 and 18:00 IST), which re-keys the P&L from
+# these tables -- so an edit to either sheet is in the P&L within the next beat.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"     # 08:30 IST
+    - cron: "0 12 * * *"    # 17:30 IST
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Read the sheets even if unchanged since the last load"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sheet-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Write credentials
+        env:
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
+          python -c "import json;json.load(open('token.json'));print('token.json parsed OK')"
+
+      - name: Sync the sheets
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then ARGS="--force"; fi
+          # exits non-zero if either sheet failed, so a changed header shows up
+          # as a red run instead of a silently stale P&L
+          python -m mp.sheets --run $ARGS
