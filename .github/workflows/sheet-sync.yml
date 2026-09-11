@@ -8,14 +8,19 @@ name: P&L sheets -> Supabase
 #
 # A sheet whose Drive modifiedTime has not moved since its last load is skipped,
 # and a changed one only writes the rows whose values changed; nothing is
-# deleted. Timed half an hour before each public.o2c_refresh() beat
-# (keyur-tbd/bc-supabase-sync, 09:00 and 18:00 IST), which re-keys the P&L from
-# these tables -- so an edit to either sheet is in the P&L within the next beat.
+# deleted. The public.o2c_refresh() beat that re-keys the P&L from these tables
+# runs on the DATABASE's clock (pg_cron, 09:00 and 14:00 IST -- see
+# o2c/pg_cron_schedule.sql in keyur-tbd/bc-supabase-sync).
+#
+# GitHub starts scheduled runs late -- 4-5 hours late in September 2026, and worst
+# on the hour -- so these fire early and off the hour: even at that delay the
+# 07:47 run lands before the 14:00 beat, and the 12:47 one before the next
+# morning's. Run it by hand (Actions tab) for an edit that must be in the P&L now.
 
 on:
   schedule:
-    - cron: "0 3 * * *"     # 08:30 IST
-    - cron: "0 12 * * *"    # 17:30 IST
+    - cron: "17 2 * * *"    # 07:47 IST
+    - cron: "17 7 * * *"    # 12:47 IST
   workflow_dispatch:
     inputs:
       force:
