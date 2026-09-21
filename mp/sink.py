@@ -299,31 +299,39 @@ class SupabaseSink:
                         time.sleep(2 * attempt)
         return written
 
-    def completed_file_ids(self, table: str) -> set:
-        """Drive file ids whose rows are ALL in `table`.
+    def completed_file_ids(self, table: str) -> Dict[str, str]:
+        """Drive file id -> when we loaded it, for files whose rows are ALL in `table`.
 
         Preferred over matching on source_file, which cannot tell a finished
         file from one that died half way through its upserts.
+
+        The load time travels with the id because an id alone cannot tell a
+        finished file from one that was EDITED IN PLACE afterwards: Blinkit's
+        monthly workbook kept its Drive id from 16 Sep 2026 while days were
+        added to it, so every run skipped it and Blinkit sat six days behind.
+        The caller compares this with the file's Drive modifiedTime.
         """
-        done, start = set(), 0
+        done: Dict[str, str] = {}
+        start = 0
         try:
             while True:
                 # Ordered paging: an unordered range() can repeat or skip rows.
                 r = (self.client.table(LOADED_TABLE)
-                     .select("drive_file_id")
+                     .select("drive_file_id,loaded_at")
                      .eq("table_name", table)
                      .order("id")
                      .range(start, start + 999)
                      .execute())
                 rows = r.data or []
-                done.update(x["drive_file_id"] for x in rows)
+                for x in rows:
+                    done[x["drive_file_id"]] = x.get("loaded_at") or ""
                 if len(rows) < 1000:
                     return done
                 start += 1000
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SUPABASE] %s unreadable (%s); falling back to "
                            "source_file matching", LOADED_TABLE, str(exc)[:80])
-            return set()
+            return {}
 
     def mark_file_loaded(self, source_key: str, table: str, meta: dict,
                          rows: int) -> None:
@@ -332,7 +340,10 @@ class SupabaseSink:
             (self.client.table(LOADED_TABLE)
              .upsert({"source_key": source_key, "table_name": table,
                       "drive_file_id": meta["id"], "source_file": meta["name"],
-                      "rows_written": rows},
+                      "rows_written": rows,
+                      # stamped on every (re)load, so an in-place edit is judged
+                      # against the LAST time we read the file, not the first
+                      "loaded_at": datetime.now(timezone.utc).isoformat()},
                      on_conflict="table_name,drive_file_id",
                      returning="minimal")
              .execute())

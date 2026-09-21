@@ -265,11 +265,15 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
         else:
             done = sink.completed_file_ids(s.table)
             before = len(files)
-            files = [f for f in files if f["id"] not in done]
+            edited = [f for f in files if f["id"] in done and _edited_since(f, done[f["id"]])]
+            files = [f for f in files if f["id"] not in done] + edited
             skipped = before - len(files)
             if skipped:
                 logger.info("[%s] resuming: %d file(s) already complete",
                             s.key, skipped)
+            for f in edited:
+                logger.info("[%s] %s was edited in Drive after we loaded it (%s > %s): reloading",
+                            s.key, f["name"], f.get("modified", ""), done[f["id"]])
 
     if limit:
         files = files[:limit]
@@ -452,6 +456,25 @@ def cmd_run(keys: Optional[List[str]], dry_run: bool, limit: Optional[int],
 
 sys.path.insert(0, PROJECT)  # etl_alerts.py lives at the repo root
 from etl_alerts import guard  # noqa: E402
+
+
+def _edited_since(meta: dict, loaded_at: str) -> bool:
+    """True when Drive says the file changed after we last loaded it.
+
+    Ten minutes of grace: a file is often still being written when a run picks
+    it up, and the ledger row is stamped a few minutes after the download.
+    Anything unparseable reads as "not edited" -- the old behaviour.
+    """
+    try:
+        modified = datetime.fromisoformat(str(meta.get("modified", "")).replace("Z", "+00:00"))
+        loaded = datetime.fromisoformat(str(loaded_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if modified.tzinfo is None:
+        modified = modified.replace(tzinfo=timezone.utc)
+    if loaded.tzinfo is None:
+        loaded = loaded.replace(tzinfo=timezone.utc)
+    return (modified - loaded).total_seconds() > 600
 
 
 def main(argv: Optional[List[str]] = None) -> int:

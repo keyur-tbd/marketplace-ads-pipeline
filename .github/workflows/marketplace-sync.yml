@@ -12,10 +12,13 @@ name: Market Place Data -> Supabase
 
 on:
   schedule:
-    # 08:30 UTC = 14:00 IST, daily. Each run loads only files the ledger has
-    # not seen, so a daily cadence costs a few minutes and keeps Supabase
-    # within a day of Drive.
-    - cron: "30 8 * * *"
+    # Three times a day: 11:00, 15:00 and 18:00 IST (05:30, 09:30, 12:30 UTC).
+    # Each run loads only files the ledger has not seen -- or that were edited
+    # in Drive since we loaded them -- so a run costs a few minutes. GitHub can
+    # start a scheduled job late; the 15:00 run also sends the data-gaps mail.
+    - cron: "30 5 * * *"
+    - cron: "30 9 * * *"
+    - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
       sources:
@@ -24,6 +27,10 @@ on:
         default: ""
       dry_run:
         description: "Parse only, write nothing"
+        type: boolean
+        default: false
+      send_gaps_mail:
+        description: "Also send the data-gaps mail after the sync"
         type: boolean
         default: false
 
@@ -95,6 +102,22 @@ jobs:
           # Deliberately no --reload: that would re-read all 3,619 files and
           # cannot finish inside a job.
           python -m mp.pipeline --run $ARGS
+
+      - name: Email the data gaps (15:00 IST run, or on request)
+        # After the sync, so the mail describes what Supabase holds NOW.
+        if: always() && (github.event.schedule == '30 9 * * *' || github.event.inputs.send_gaps_mail == 'true')
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GAPS_MAIL_TO: harshil@thebakersdozen.in
+        run: python -m mp.gaps_report --send
 
       - name: Report table sizes
         if: always()
