@@ -4,7 +4,7 @@
     python -m mp.sheets --run                    # load every sheet that changed
     python -m mp.sheets --run --source pnl_feeder --force
 
-Two sheets, both read as marketing@thebakersdozen.in (the same token.json as
+Three sheets, all read as marketing@thebakersdozen.in (the same token.json as
 the Drive sync):
 
   campaign_master  "Ecom Campaign Master" (owned by instamart@, edited daily by
@@ -13,6 +13,11 @@ the Drive sync):
                    (Birbal migration 066). -> ref_ads_campaign, ref_ads_name_map
   pnl_feeder       the P&L "Feeder File": the below-gross-margin costs by month
                    (Birbal migration 045). -> the seven pnl_* tables
+  party_master     the party sheet's "Customer Location & Route MASTER" tab:
+                   ship-to name -> the party the business calls it (Amazon Fresh,
+                   Reliance Signature, Ratnadeep, GT ...). Every Birbal board
+                   names parties this way (Birbal migration 095).
+                   -> ref_party_master
 
 Incremental, in two layers:
 
@@ -22,9 +27,11 @@ Incremental, in two layers:
      row is UPSERTED on the target's own key and a row is written only when a
      value differs, so the counts reported are real inserts and real updates.
 
-Nothing is ever deleted: a campaign dropped from the sheet keeps its mapping so
-its past spend keeps landing on its product. Every tab is matched on its HEADER
-NAMES, never on position; a tab whose headers changed aborts that sheet's load
+Nothing is deleted from the P&L sheets' tables: a campaign dropped from the
+sheet keeps its mapping so its past spend keeps landing on its product. The
+party tab is the exception -- a ship-to taken off it stops naming a party
+(guarded: a read of fewer than 500 rows deletes nothing). Every tab is matched
+on its HEADER NAMES, never on position; a tab whose headers changed aborts that sheet's load
 (the others still run) rather than writing shifted columns.
 
 The P&L picks the new rows up at the next public.o2c_refresh() beat (09:00 and
@@ -41,7 +48,9 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+import httplib2
 from google.auth.transport.requests import Request
+from google_auth_httplib2 import AuthorizedHttp
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
@@ -69,7 +78,10 @@ def _clients():
         if os.path.dirname(os.path.abspath(path)) == PROJECT:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(creds.to_json())
-    return (build("sheets", "v4", credentials=creds, cache_discovery=False),
+    # 180 s, not httplib2's 60: the party sheet takes 30-75 s to serve one tab, and
+    # at 60 s every other read of it timed out
+    sheets_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=180))
+    return (build("sheets", "v4", http=sheets_http, cache_discovery=False),
             build("drive", "v3", credentials=creds, cache_discovery=False))
 
 
@@ -82,7 +94,7 @@ def _modified_time(drive, sheet_id: str) -> dt.datetime:
 def _grid(sheets, sheet_id: str, tab: str, cols: str = "AZ", rows: int = 20000):
     return sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"'{tab}'!A1:{cols}{rows}",
-        valueRenderOption="UNFORMATTED_VALUE").execute().get("values", [])
+        valueRenderOption="UNFORMATTED_VALUE").execute(num_retries=2).get("values", [])
 
 
 def _header_index(tab: str, header: Sequence, spec: Dict[str, Sequence[str]],
@@ -352,6 +364,54 @@ def load_feeder(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
 # Driver                                                                      #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# The party master: "Customer Location & Route MASTER"                        #
+# --------------------------------------------------------------------------- #
+
+# The SKU POD Master Tracker (owned by the supply team). Its "Customer Location &
+# Route MASTER" tab names the party every ship-to belongs to; Birbal shows these
+# parties on every board (Birbal migration 094). The tracker is a monthly workbook,
+# so its id can change: PARTY_MASTER_SHEET overrides the default without a deploy.
+PARTY_MASTER_SHEET = os.environ.get("PARTY_MASTER_SHEET", "1q2XU3WufZuflL-n9hy5HyB0YmMptbtfGi3WCayBKGls")
+PARTY_MASTER_TAB = ("Customer Location & Route MASTER", {
+    "ship_to_name": ["name"], "party_raw": ["display name"], "channel": ["channel"],
+    "city": ["city location"], "city_type": ["city type"]})
+
+
+def load_party_master(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    tab, spec = PARTY_MASTER_TAB
+    # A1:L6000, not the default A1:AZ20000: the tab is ~2k rows and its columns sit in A-E,
+    # and the wide read took over a minute (one run timed out)
+    grid = _grid(sheets, PARTY_MASTER_SHEET, tab, cols="L", rows=6000)
+    if not grid:
+        raise ValueError(f"tab {tab!r} is empty")
+    idx = _header_index(tab, grid[0], spec, optional=("city", "city_type"))
+    rows: Dict[str, tuple] = {}
+    for r in grid[1:]:
+        name = _text(_cell(r, idx["ship_to_name"]))
+        party = _text(_cell(r, idx["party_raw"]))
+        if not name or not party:
+            continue
+        key = re.sub(r"\s+", " ", name).strip().upper()
+        # a ship-to listed twice keeps its last row (the tab has no conflicting pair today)
+        rows[key] = (key, name, party, _text(_cell(r, idx["channel"])),
+                     _text(_cell(r, idx["city"])) if "city" in idx else None,
+                     _text(_cell(r, idx["city_type"])) if "city_type" in idx else None)
+    if not write:
+        return len(rows), 0, 0, f"{len(set(v[2] for v in rows.values()))} parties"
+    ins, upd = merge(cur, "ref_party_master",
+                     ["ship_to_key", "ship_to_name", "party_raw", "channel", "city", "city_type"],
+                     ["ship_to_key"], list(rows.values()), "loaded_at")
+    # a ship-to taken off the tab stops naming a party; guarded so a half-read tab
+    # (a renamed header, an API hiccup) cannot empty the map
+    gone = 0
+    if len(rows) >= 500:
+        cur.execute("delete from public.ref_party_master where not (ship_to_key = any(%s))",
+                    [list(rows.keys())])
+        gone = cur.rowcount
+    return len(rows), ins, upd, f"{len(set(v[2] for v in rows.values()))} parties, {gone} dropped"
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -362,6 +422,7 @@ class SheetSource:
 SOURCES = [
     SheetSource("campaign_master", CAMPAIGN_SHEET, load_campaign_master),
     SheetSource("pnl_feeder", FEEDER_SHEET, load_feeder),
+    SheetSource("party_master", PARTY_MASTER_SHEET, load_party_master),
 ]
 
 
