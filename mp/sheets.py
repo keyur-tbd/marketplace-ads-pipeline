@@ -4,7 +4,7 @@
     python -m mp.sheets --run                    # load every sheet that changed
     python -m mp.sheets --run --source pnl_feeder --force
 
-Three sheets, all read as marketing@thebakersdozen.in (the same token.json as
+Five sheets, all read as marketing@thebakersdozen.in (the same token.json as
 the Drive sync):
 
   campaign_master  "Ecom Campaign Master" (owned by instamart@, edited daily by
@@ -18,6 +18,10 @@ the Drive sync):
                    Reliance Signature, Ratnadeep, GT ...). Every Birbal board
                    names parties this way (Birbal migration 095).
                    -> ref_party_master
+  prn_bb, prn_nb   the marketing team's Big Basket / Nature's Basket PRN sheets (tabs BB RTV
+                   and "Nature's Basket Raw sheet"): PRN lines for the months before the
+                   partners' daily PRN feeds began (Birbal migration 105, PRN tracking).
+                   -> prn_marketing_lines
 
 Incremental, in two layers:
 
@@ -412,6 +416,173 @@ def load_party_master(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     return len(rows), ins, upd, f"{len(set(v[2] for v in rows.values()))} parties, {gone} dropped"
 
 
+# --------------------------------------------------------------------------- #
+# The marketing team's PRN sheets (Big Basket, Nature's Basket)               #
+# --------------------------------------------------------------------------- #
+# The PRN LINES behind the marketing team's two PRN trackers, for the months before the partners'
+# daily PRN feeds (bb_net_prn from 2026-08-19, nb_prn from 2026-08-25) began. Birbal's SCM Tracker
+# "PRN tracking" view (migration 105) reads the feeds first, these lines second.
+#   Big Basket    "Big Basket 2027 PRN Summary", tab BB RTV: PRN x ship-to x SKU, built by the team
+#                 from BB's PRN mails and portal exports ("Data from" = MAIL / PORTAL)
+#   Nature's Basket "Nature's Basket PRN Data 2027", tab "Nature's Basket Raw sheet" (header on row
+#                 2, a totals row above it): NB's SAP RTV lines -- Art. Doc. = the PRN document,
+#                 ref no = the ORDER number our credit memos quote, negative Qty / LC Amt.
+PRN_BB_SHEET = os.environ.get("PRN_BB_SHEET", "1rq6JYWnMkxvGuDUDH33srFxVbH6Sni9VaaWLukL_Pqc")
+PRN_NB_SHEET = os.environ.get("PRN_NB_SHEET", "1i5_UuAeQUzziiaTPcMD8bAeLmds_CXSdDaTdkavhI7Q")
+# Big Basket: the team's "PRN wise mapping" takes each PRN (ship-to code + PRN number) from the Mail tab
+# if BB mailed it, else the Portal export, else the "Not Found in Mail & Portal" tab -- verified to rebuild
+# its Total Unique Value on all 1,529 PRNs. The loader takes the SKU lines by the same rule.
+PRN_BB_TABS = [
+    ("MAIL", "Mail", 0, {"prn_no": ["gonno"], "ship_to_code": ["shiptocode"], "branch": ["shiptoname"],
+                         "prn_date": ["invoicedate"], "article_code": ["skucode"], "description": ["skudesc"],
+                         "quantity": ["quantity"], "value": ["totalvalue"], "warehouse": ["erp warehouse"],
+                         "city": ["city"]}),
+    ("PORTAL", "Portal", 1, {"prn_no": ["prn_number"], "ship_to_code": ["loccode"], "branch": ["locname"],
+                             "prn_date": ["prndate"], "article_code": ["skucode"], "description": ["skudesc"],
+                             "quantity": ["qty"], "value": ["totalval"], "warehouse": ["erp werehouse", "erp warehouse"],
+                             "city": ["city"]}),
+    ("NOT FOUND", "Not Found in Mail & Portal", 1, {"prn_no": ["prn_number"], "ship_to_code": ["loccode"], "branch": ["locname"],
+                             "prn_date": ["prndate"], "article_code": ["skucode"], "description": ["skudesc"],
+                             "quantity": ["qty"], "value": ["totalval"], "warehouse": ["erp werehouse", "erp warehouse"],
+                             "city": ["city"]}),
+]
+PRN_NB_TAB = ("Nature's Basket Raw sheet", {"article_code": ["article"], "description": ["article description"],
+                                             "tbd_item": ["tbd item name"], "category": ["category"],
+                                             "city": ["city"], "branch": ["name 1"], "prn_no": ["art. doc."],
+                                             "prn_date": ["doc. date"], "quantity": ["qty"], "value": ["lc amt."],
+                                             "order_no": ["ref no"], "posting_status": ["posting status"],
+                                             "sro_status": ["status"], "sro_created": ["sro created"]})
+PRN_COLS = ["line_key", "platform", "prn_no", "order_no", "prn_date", "branch", "ship_to_code", "city",
+            "article_code", "description", "tbd_item", "category", "quantity", "value", "data_from", "warehouse",
+            "mkt_status"]
+
+
+def _date(v) -> Optional[dt.date]:
+    if isinstance(v, (int, float)) and 20000 < v < 80000:
+        return EPOCH + dt.timedelta(days=int(v))
+    if isinstance(v, str) and re.match(r"^\d{4}-\d{2}-\d{2}", v.strip()):
+        return dt.date.fromisoformat(v.strip()[:10])
+    return None
+
+
+def _num(v) -> Optional[float]:
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _ident(v) -> Optional[str]:
+    """PRN / order / article numbers arrive as numbers: keep them as whole-number text."""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return _text(v)
+
+
+def _mkt_status(posted, status, created) -> Optional[str]:
+    """The marketing sheet's own verdict, in the tracker's words."""
+    posted, status, created = (_text(x) or "" for x in (posted, status, created))
+    if posted.lower() == "posted":
+        return "Posted"
+    if created.lower() == "no" or status.lower().startswith("sro creation"):
+        return "SRO creation pending"
+    for word in ("Open", "Pending Approval", "Released"):
+        if status.lower() == word.lower():
+            return word
+    return status or None
+
+
+def _prn_rows(platform: str, grid: List[list], header_row: int, tab: str, spec, data_from=None,
+              status_of: Optional[Dict[str, str]] = None) -> Dict[str, list]:
+    idx = _header_index(tab, grid[header_row], spec,
+                        optional=("data_from", "ship_to_code", "tbd_item", "category", "city", "order_no", "warehouse",
+                                  "posting_status", "sro_status", "sro_created"))
+    rows: Dict[str, list] = {}
+    for r in grid[header_row + 1:]:
+        prn = _ident(_cell(r, idx["prn_no"]))
+        when = _date(_cell(r, idx["prn_date"]))
+        if not prn or not when or not re.match(r"^\d+$", prn):
+            continue
+        g = lambda k: _cell(r, idx[k]) if k in idx else None  # noqa: E731
+        art = _ident(g("article_code"))
+        branch = _text(g("branch"))
+        key = "|".join([platform, prn, art or "", (branch or "").upper()])
+        qty, val = abs(_num(g("quantity")) or 0.0), abs(_num(g("value")) or 0.0)
+        if key in rows:                       # the same SKU twice on one PRN: one line, summed
+            rows[key][12] += qty
+            rows[key][13] += val
+            continue
+        wh = _text(g("warehouse"))
+        rows[key] = [key, platform, prn, _ident(g("order_no")), when, branch, _text(g("ship_to_code")),
+                     _text(g("city")), art, _text(g("description")), _text(g("tbd_item")), _text(g("category")),
+                     qty, val, data_from or _text(g("data_from")),
+                     wh if wh and re.match(r"^[A-Z]{3,}WH", wh) else None,
+                     (status_of or {}).get((_text(g("ship_to_code")) or "").upper() + prn)
+                     if status_of is not None else _mkt_status(g("posting_status"), g("sro_status"), g("sro_created"))]
+    return rows
+
+
+def _write_prn(cur, write: bool, platform: str, rows: Dict[str, list]):
+    value = sum(r[13] for r in rows.values())
+    detail = f"{len({r[2] for r in rows.values()})} PRNs, Rs {value / 1e5:.1f} L"
+    if not write:
+        return len(rows), 0, 0, detail
+    ins, upd = merge(cur, "prn_marketing_lines", PRN_COLS, ["line_key"],
+                     [tuple(r) for r in rows.values()], "loaded_at")
+    gone = 0
+    if len(rows) >= 500:                      # a half-read tab never empties the history
+        cur.execute("delete from public.prn_marketing_lines where platform = %s and not (line_key = any(%s))",
+                    [platform, list(rows.keys())])
+        gone = cur.rowcount
+    return len(rows), ins, upd, f"{detail}, {gone} dropped"
+
+
+def load_prn_bb(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    # the team's own list of PRNs ("PRN wise mapping", CONCATENATE = ship-to code + PRN number): the
+    # Portal export also carries PRNs the team does not track, which must not inflate the history
+    mapping = _grid(sheets, PRN_BB_SHEET, "PRN wise mapping ", cols="W", rows=40000)
+    head = [str(h).strip().lower() for h in mapping[1]] if len(mapping) > 1 else []
+    i_status = head.index("status") if "status" in head else None
+    i_posted = head.index("posted") if "posted" in head else None
+    listed, status_of = set(), {}
+    for r in mapping[2:]:
+        if len(r) > 3 and _ident(r[3]):
+            key = str(_ident(r[3])).upper()
+            listed.add(key)
+            status_of[key] = _mkt_status(_cell(r, i_posted) if i_posted is not None else None,
+                                         _cell(r, i_status) if i_status is not None else None, None)
+    if len(listed) < 500:
+        raise ValueError(f"'PRN wise mapping' lists only {len(listed)} PRNs; refusing to load a partial history")
+    taken: Dict[str, str] = {}                # ship-to code + PRN -> the tab it comes from
+    out: Dict[str, list] = {}
+    for label, tab, header_row, spec in PRN_BB_TABS:
+        grid = _grid(sheets, PRN_BB_SHEET, tab, cols="AF", rows=40000)
+        if len(grid) <= header_row:
+            raise ValueError(f"tab {tab!r} is empty")
+        rows = _prn_rows("Big Basket", grid, header_row, tab, spec, data_from=label, status_of=status_of)
+        mine = {}
+        for key, r in rows.items():
+            prn_key = (r[6] or r[5] or "").upper() + "|" + r[2]
+            if ((r[6] or "").upper() + r[2]) not in listed:
+                continue
+            if taken.get(prn_key, label) != label:
+                continue                      # an earlier tab already gave this PRN
+            mine[prn_key] = label
+            out[key] = r
+        taken.update(mine)
+    return _write_prn(cur, write, "Big Basket", out)
+
+
+def load_prn_nb(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    tab, spec = PRN_NB_TAB
+    grid = _grid(sheets, PRN_NB_SHEET, tab, cols="AD", rows=40000)
+    if len(grid) <= 1:
+        raise ValueError(f"tab {tab!r} is empty")
+    return _write_prn(cur, write, "Nature's Basket", _prn_rows("Nature's Basket", grid, 1, tab, spec, data_from="SAP RTV"))
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -423,6 +594,8 @@ SOURCES = [
     SheetSource("campaign_master", CAMPAIGN_SHEET, load_campaign_master),
     SheetSource("pnl_feeder", FEEDER_SHEET, load_feeder),
     SheetSource("party_master", PARTY_MASTER_SHEET, load_party_master),
+    SheetSource("prn_bb", PRN_BB_SHEET, load_prn_bb),
+    SheetSource("prn_nb", PRN_NB_SHEET, load_prn_nb),
 ]
 
 
