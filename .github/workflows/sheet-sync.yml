@@ -5,6 +5,9 @@ name: P&L sheets -> Supabase
 #
 #   campaign_master  Ecom Campaign Master -> ref_ads_campaign, ref_ads_name_map
 #   pnl_feeder       P&L Feeder File      -> the seven pnl_* cost tables
+#   party_master, prn_bb, prn_nb           -> ref_party_master, prn_marketing_lines
+#   capping_booked   ERP Capping RTV Data -> rtv_capping_booked (the ledger is
+#                    rebuilt by the same o2c_refresh() beat)
 #
 # A sheet whose Drive modifiedTime has not moved since its last load is skipped,
 # and a changed one only writes the rows whose values changed; nothing is

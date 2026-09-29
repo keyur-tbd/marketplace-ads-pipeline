@@ -4,7 +4,7 @@
     python -m mp.sheets --run                    # load every sheet that changed
     python -m mp.sheets --run --source pnl_feeder --force
 
-Five sheets, all read as marketing@thebakersdozen.in (the same token.json as
+Six sheets, all read as marketing@thebakersdozen.in (the same token.json as
 the Drive sync):
 
   campaign_master  "Ecom Campaign Master" (owned by instamart@, edited daily by
@@ -22,6 +22,9 @@ the Drive sync):
                    and "Nature's Basket Raw sheet"): PRN lines for the months before the
                    partners' daily PRN feeds began (Birbal migration 105, PRN tracking).
                    -> prn_marketing_lines
+  capping_booked   finance's "ERP Capping RTV Data" (tabs FY26-27, FY25-26): each booked
+                   capping-RTV credit memo and the sales month it settles (Birbal
+                   migrations 036/044/075). -> rtv_capping_booked
 
 Incremental, in two layers:
 
@@ -33,8 +36,9 @@ Incremental, in two layers:
 
 Nothing is deleted from the P&L sheets' tables: a campaign dropped from the
 sheet keeps its mapping so its past spend keeps landing on its product. The
-party tab is the exception -- a ship-to taken off it stops naming a party
-(guarded: a read of fewer than 500 rows deletes nothing). Every tab is matched
+party tab and the capping sheet are the exceptions -- a ship-to taken off the tab
+stops naming a party, a credit memo taken off the capping sheet stops being a
+capping RTV (guarded: a read of fewer than 500 / 400 rows deletes nothing). Every tab is matched
 on its HEADER NAMES, never on position; a tab whose headers changed aborts that sheet's load
 (the others still run) rather than writing shifted columns.
 
@@ -583,6 +587,92 @@ def load_prn_nb(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     return _write_prn(cur, write, "Nature's Basket", _prn_rows("Nature's Basket", grid, 1, tab, spec, data_from="SAP RTV"))
 
 
+# --------------------------------------------------------------------------- #
+# ERP Capping RTV Data                                                        #
+# --------------------------------------------------------------------------- #
+# Finance's list of the booked capping-RTV credit memos and the SALES month each settles
+# (Birbal migration 036; since 075 the sheet outranks the return reason code). A note listed
+# here is EXP dated to that month, and a month x platform with a booked note carries no
+# provision (044). public.o2c_refresh() rebuilds mv_rtv_capping_ledger at its 09:00/14:00 IST
+# beat, so this only keeps the table current. Was a one-off manual load (9 Sep 2026) until
+# 29 Sep 2026; capping_rtv_pipeline/load_cm_map.py in D:\Python\Birbal is the old loader.
+CAPPING_SHEET = "1keFOUYTRjQ7DfBYbncPe216fgjYd1fbafCKQT5OiMqk"
+CAPPING_TABS = ["FY26-27", "FY25-26"]            # a note on both tabs keeps the FY26-27 row
+CAPPING_SPEC = {"platform_raw": ["capping rtv"], "customer_no": ["customer no."],
+                "doc_no": ["document no."], "external_doc_no": ["external document no."],
+                "taxable_amount": ["taxable amount"],
+                "sales_month": ["month", "hitesh month"]}   # 'Hitesh MOnth' on FY25-26
+# the sheet names the partner, the register the invoicing entity (Instamart bills through five)
+CAPPING_PLATFORM = {"ZEPTO": "Zepto", "BLINKIT": "Blinkit", "SWIGGY": "Instamart",
+                    "INSTAMART": "Instamart", "FLIPKART": "Flipkart"}
+CAPPING_COLS = ["doc_no", "platform_raw", "platform", "customer_no", "external_doc_no",
+                "sales_month", "taxable_amount", "source_tab"]
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def _sales_month(v) -> Optional[dt.date]:
+    """FY26-27 holds real dates (serials); FY25-26 text like "Nov'24 Capping RTV"."""
+    d = _date(v)
+    if d:
+        return d.replace(day=1)
+    m = re.search(r"([A-Za-z]{3})[a-z]*[\s\-']*(\d{2,4})", _text(v) or "")
+    if not m or m.group(1).lower() not in _MONTHS:
+        return None
+    yr = int(m.group(2))
+    return dt.date(yr + 2000 if yr < 100 else yr, _MONTHS[m.group(1).lower()], 1)
+
+
+def load_capping_booked(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    rows: Dict[str, tuple] = {}
+    clashes = []
+    for tab in CAPPING_TABS:
+        # A-K only: the columns past K are scratch working
+        grid = _grid(sheets, CAPPING_SHEET, tab, cols="K", rows=5000)
+        if not grid:
+            raise ValueError(f"tab {tab!r} is empty")
+        idx = _header_index(tab, grid[0], CAPPING_SPEC)
+        n = 0
+        for r in grid[1:]:
+            doc = _text(_cell(r, idx["doc_no"]))
+            if not doc:
+                continue
+            plat = _text(_cell(r, idx["platform_raw"])) or ""
+            month = _sales_month(_cell(r, idx["sales_month"]))
+            if doc in rows:                  # one memo split over several rows: first row wins
+                if rows[doc][5] != month:
+                    clashes.append(f"{doc} {rows[doc][5]} vs {month}")
+                continue
+            rows[doc] = (doc, plat, CAPPING_PLATFORM.get(plat.upper()),
+                         _ident(_cell(r, idx["customer_no"])),
+                         _ident(_cell(r, idx["external_doc_no"])),
+                         month, _num(_cell(r, idx["taxable_amount"])), tab)
+            n += 1
+        logger.info("  %-8s %4d credit memos", tab, n)
+    unmapped = sorted({r[1] for r in rows.values() if not r[2]})
+    if unmapped:
+        # a new partner name would load with no platform and silently drop out of the ledger
+        raise ValueError(f"'Capping RTV' values with no platform mapping: {unmapped}; "
+                         f"add them to CAPPING_PLATFORM")
+    for c in clashes[:10]:
+        logger.warning("  credit memo given two sales months, first kept: %s", c)
+    months = sorted({r[5] for r in rows.values() if r[5]})
+    detail = (f"{len(rows)} notes, sales months {months[0]}..{months[-1]}, "
+              f"{sum(1 for r in rows.values() if not r[5])} with no month")
+    if not write:
+        return len(rows), 0, 0, detail
+    ins, upd = merge(cur, "rtv_capping_booked", CAPPING_COLS, ["doc_no"],
+                     list(rows.values()), "loaded_at")
+    # a note taken off the sheet is no longer a capping RTV; guarded so a half-read
+    # sheet cannot empty the table
+    gone = 0
+    if len(rows) >= 400:
+        cur.execute("delete from public.rtv_capping_booked where not (doc_no = any(%s))",
+                    [list(rows.keys())])
+        gone = cur.rowcount
+    return len(rows), ins, upd, f"{detail}, {gone} dropped"
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -596,6 +686,7 @@ SOURCES = [
     SheetSource("party_master", PARTY_MASTER_SHEET, load_party_master),
     SheetSource("prn_bb", PRN_BB_SHEET, load_prn_bb),
     SheetSource("prn_nb", PRN_NB_SHEET, load_prn_nb),
+    SheetSource("capping_booked", CAPPING_SHEET, load_capping_booked),
 ]
 
 
