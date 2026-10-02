@@ -39,7 +39,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from . import dbadmin, drive, schema
+from . import dbadmin, dedupe, drive, schema
 from .readers import WrongShape, date_from_filename, read_file
 from .schema import COMMON_DATE, COMMON_TEXT
 from .sink import SupabaseSink, build_rows, load_dotenv, mask
@@ -245,7 +245,7 @@ def _within_since(meta: dict, since: Optional[str]) -> bool:
 def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                types_by_table: Dict[str, Dict[str, str]],
                dry_run: bool, limit: Optional[int], since: Optional[str],
-               reload_files: bool) -> dict:
+               reload_files: bool, guard: Optional["dedupe.Guard"] = None) -> dict:
     started = datetime.now(timezone.utc)
     files = [f for f in drive.files_for(s, index) if _within_since(f, since)]
     seen = len(files)
@@ -258,6 +258,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                 "files_seen": seen, "files_loaded": 0, "rows_written": 0}
 
     skipped = 0
+    edited_ids: set = set()
     if sink and not dry_run:
         if reload_files:
             # --reload must really re-read, so forget what the ledger claims.
@@ -266,6 +267,7 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
             done = sink.completed_file_ids(s.table)
             before = len(files)
             edited = [f for f in files if f["id"] in done and _edited_since(f, done[f["id"]])]
+            edited_ids = {f["id"] for f in edited}
             files = [f for f in files if f["id"] not in done] + edited
             skipped = before - len(files)
             if skipped:
@@ -291,6 +293,8 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
     unmapped: Dict[str, int] = defaultdict(int)
     no_date = 0
     failures: List[str] = []
+    duplicates_removed = 0
+    deduped: List[str] = []
 
     for n, meta in enumerate(files, 1):
         try:
@@ -300,7 +304,25 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
             failures.append(f"{meta['name']}: download {exc}")
             continue
 
+        # Edited in Drive since we loaded it: the new version REPLACES the old one.
+        # Upserting it on top left the old version's rows in place wherever a number
+        # had changed -- the repeated rows a growing monthly export used to leave. If
+        # the load below fails, the file stays out of the ledger and the next run
+        # loads it again, so nothing is lost for longer than one run.
+        if guard and not dry_run and meta["id"] in edited_ids:
+            try:
+                gone = guard.replace_file(s.table, meta["id"])
+                logger.info("[%s] %s: removed %d rows of its previous version",
+                            s.key, meta["name"], gone)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[%s] could not clear the old version of %s: %s",
+                             s.key, meta["name"], exc)
+                failures.append(f"{meta['name']}: replace {exc}")
+                continue
+
         file_rows = 0
+        lo: Optional[str] = None
+        hi: Optional[str] = None
         occurrences: Dict[str, int] = {}
         # One hash per batch, checked after the file is done. A batch that the
         # API accepted but did not persist is otherwise completely silent.
@@ -336,6 +358,12 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                 db_rows, repeated = build_rows(batch, types, occurrences,
                                                raw=not s.projected)
                 repeats += repeated
+                for r in db_rows:
+                    d = r.get(date_key)
+                    if d:
+                        d = str(d)
+                        lo = d if lo is None or d < lo else lo
+                        hi = d if hi is None or d > hi else hi
                 if not dry_run and sink:
                     rows_written += sink.upsert(s.table, db_rows)
                     if db_rows:
@@ -362,6 +390,26 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
                              s.key, meta["name"], len(probes) - found, len(probes))
                 unverified.append(f"{meta['name']} ({len(probes)-found}/{len(probes)})")
                 continue
+            # The same rows may already be here from another file -- a copy in a
+            # second Drive root, two overlapping "parts" of a month, a daily file
+            # inside a monthly one. row_hash only collapses those while the loader
+            # is unchanged between the two loads, so check what is stored instead.
+            if guard:
+                try:
+                    exact, superseded = guard.after_load(s.table, meta["id"], meta["name"], lo, hi)
+                    if exact or superseded:
+                        duplicates_removed += exact + superseded
+                        deduped.append(f"{meta['name']} ({exact:,} exact duplicates, "
+                                       f"{superseded:,} rows of older exports it restates)")
+                        logger.warning("[%s] %s: removed %d exact duplicates and %d superseded "
+                                       "rows (logged in %s)", s.key, meta["name"], exact,
+                                       superseded, dedupe.LOG_TABLE)
+                except Exception as exc:  # noqa: BLE001
+                    # Still mark it loaded: the rows are in, and the daily audit
+                    # reports any duplicate this left behind.
+                    logger.error("[%s] duplicate check failed for %s: %s",
+                                 s.key, meta["name"], exc)
+                    failures.append(f"{meta['name']}: duplicate check {exc}")
             sink.mark_file_loaded(s.key, s.table, meta, file_rows)
         loaded += 1
         drive.discard(path)
@@ -376,6 +424,8 @@ def run_source(s: Source, sink: Optional[SupabaseSink], svc, index: dict,
         "files_seen": seen, "files_loaded": loaded, "files_skipped": skipped,
         "rows_parsed": rows_parsed, "rows_written": rows_written,
         "repeated_lines": repeats,
+        "duplicates_removed": duplicates_removed,
+        "deduped": deduped[:10],
         "rows_without_date": no_date,
         "unmapped_columns": dict(sorted(unmapped.items(), key=lambda x: -x[1])[:15]),
         "failures": failures[:10],
@@ -407,12 +457,13 @@ def cmd_run(keys: Optional[List[str]], dry_run: bool, limit: Optional[int],
         if missing:
             print("Supabase not configured: " + ", ".join(missing), file=sys.stderr)
             return 1
+    guard = None if dry_run else dedupe.Guard()
 
     results = []
     for s in select_sources(keys):
         logger.info("=== %s  %s -> %s ===", s.order, s.key, s.table)
         results.append(run_source(s, sink, svc, index, types_by_table,
-                                  dry_run, limit, since, reload_files))
+                                  dry_run, limit, since, reload_files, guard))
 
     print("\n" + "=" * 100)
     print("DRY RUN - nothing written" if dry_run else "LOAD COMPLETE")
@@ -436,10 +487,12 @@ def cmd_run(keys: Optional[List[str]], dry_run: bool, limit: Optional[int],
 
     problems = [r for r in results if r.get("failures")
                 or r.get("unmapped_columns") or r.get("misfiled")
-                or r.get("unverified")]
+                or r.get("unverified") or r.get("deduped")]
     if problems:
         print("\n--- attention ---")
         for r in problems:
+            for d in r.get("deduped", []):
+                print(f"  {r['source']}: DUPLICATES of an earlier file removed -> {d}")
             if r.get("unmapped_columns"):
                 print(f"  {r['source']}: columns not in schema -> "
                       f"{list(r['unmapped_columns'])[:8]}")

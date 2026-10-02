@@ -560,17 +560,24 @@ def read_file(path: str, source: Source, meta: dict) -> Iterator[List[Dict[str, 
             # column is only the fallback, which is what the bulk back-history
             # files need - their names are ranges, so file_date is None and
             # their own Date column is the only per-row date available.
+            # The grain says where the date came from: the row's own column is a
+            # day; only a date taken from the file name carries the name's grain.
+            # Comparing report_date with file_date used to decide this, which in a
+            # monthly file ("Jun-26 Part 1.csv" -> 1 Jun) labelled every row dated
+            # the 1st 'month' although its own column said it was that day.
             if source.date_from_filename:
                 report_date = file_date
+                from_name = report_date is not None
                 if report_date is None and date_col:
                     report_date = parse_date(row.get(date_col))
             else:
                 report_date = parse_date(row.get(date_col)) if date_col else None
+                from_name = report_date is None
                 if report_date is None:
                     report_date = file_date
 
             row["report_date"] = report_date
-            row["date_grain"] = grain if report_date == file_date else "day"
+            row["date_grain"] = grain if from_name else "day"
 
         if source.projected:
             # Replace every row with its projection. Done last so the date

@@ -3,7 +3,7 @@
     python -m mp.gaps_report            # print it
     python -m mp.gaps_report --send     # print it and mail it (GAPS_MAIL_TO, comma separated)
 
-Run after the sync, so it describes what Supabase holds NOW. Four questions:
+Run after the sync, so it describes what Supabase holds NOW. Five questions:
 
   1. How far behind is each party's ADS feed, and which days inside the last 60 are missing?
   2. How far behind is each party's SECONDARY SALES (sell-out) feed?
@@ -11,6 +11,7 @@ Run after the sync, so it describes what Supabase holds NOW. Four questions:
      after we loaded them? (Files deliberately skipped at the 9 Sep 2026 cutover are not
      nagged about: a skipped file that nobody has touched since is a decision, not a gap.)
   4. Does what the parties' ad portals report still agree with what finance booked?
+  5. Is any row loaded twice -- the same rows, or the same line restated, from more than one file?
 
 It only reads. It never raises into the workflow: a report that cannot be built says so in
 the mail rather than failing the sync it follows.
@@ -157,6 +158,38 @@ def portal_section(cur) -> tuple[List[str], int]:
     return lines, issues
 
 
+def duplicates_section(cur, today: date) -> tuple[List[str], int]:
+    """Rows counted twice because more than one file carries them (mp/dedupe.py).
+
+    Exact duplicates should never be here -- the load removes them -- so any is a fault.
+    'Restated' lines are the same ad line on the same day exported with different numbers
+    by several files (an interim and a final export of a month); Amazon's are resolved
+    automatically (newest file wins), everyone else's need a person to say which file is
+    the real one, and sums double-count them until then.
+    """
+    from . import dedupe
+    since = str(today - timedelta(days=LOOKBACK_DAYS))
+    ads = dedupe.ads_tables()
+    lines, issues = [], 0
+    for table in sorted({s.table for s in ordered_sources()}):
+        found = dedupe.audit(cur, table, since, None, restated=True, ads=ads)
+        dup = [(m, extra) for m, _, extra, _ in found if extra]
+        rest = [(m, n) for m, _, _, n in found if n]
+        if dup:
+            issues += 1
+            lines.append(f"  {table}: {sum(e for _, e in dup):,} duplicate rows ("
+                         + ", ".join(f"{m:%b %Y} {e:,}" for m, e in dup)
+                         + ") -- the load should have removed these; check the run log")
+        if rest:
+            issues += 1
+            lines.append(f"  {table}: {sum(n for _, n in rest):,} rows are lines that more than one "
+                         "file exports with different numbers (" + ", ".join(f"{m:%b %Y} {n:,}" for m, n in rest)
+                         + "). Which file is the final one? Until one is removed, totals count both.")
+    if not lines:
+        lines.append(f"  No row is loaded twice in the last {LOOKBACK_DAYS} days.")
+    return lines, issues
+
+
 def build() -> tuple[str, str]:
     today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
     parts: List[str] = []
@@ -169,6 +202,7 @@ def build() -> tuple[str, str]:
             ("2. SECONDARY SALES FEEDS (sell-out)", sales_section, (cur, today)),
             ("3. FILES: DRIVE AGAINST SUPABASE", files_section, (cur,)),
             ("4. PORTAL ADS AGAINST FINANCE", portal_section, (cur,)),
+            ("5. ROWS LOADED TWICE (the same rows from more than one file)", duplicates_section, (cur, today)),
         ]:
             parts.append(title)
             try:
