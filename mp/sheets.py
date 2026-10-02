@@ -12,7 +12,7 @@ the Drive sync):
                    group it advertises. Keys the P&L's ads onto products
                    (Birbal migration 066). -> ref_ads_campaign, ref_ads_name_map
   pnl_feeder       the P&L "Feeder File": the below-gross-margin costs by month
-                   (Birbal migration 045). -> the seven pnl_* tables
+                   (Birbal migration 045). -> six pnl_* tables (store salaries: staff_salary_loader, 132)
   party_master     the party sheet's "Customer Location & Route MASTER" tab:
                    ship-to name -> the party the business calls it (Amazon Fresh,
                    Reliance Signature, Ratnadeep, GT ...). Every Birbal board
@@ -271,8 +271,7 @@ def load_campaign_master(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
 # --------------------------------------------------------------------------- #
 
 FEEDER_SHEET = "1NScaI-YVRVJTvsSo01dd60GiRlk5B9v6_Vf4qSSWjSY"
-FEEDER_TEXT = {"city", "party", "party_name", "erp_name", "promoter_tsi", "designation",
-               "salary_name", "firm"}
+FEEDER_TEXT = {"city", "party"}
 
 # tab -> (target table, key columns, {sheet header (lowercased) -> db column})
 FEEDER_TABS = [
@@ -293,16 +292,10 @@ FEEDER_TABS = [
         "month": "month", "marketplace": "marketplace", "trade": "trade"}),
     ("Rent and Utilities", "pnl_rent_utilities", ["month", "city"], {
         "month": "month", "city": "city", "amount": "amount"}),
-    # 'Month' is the ELEVENTH column of this tab, past the ten a first read samples.
-    # Leaving it out of the key folded five months into one (1,692 rows -> 124).
-    ("Salaries Stores & promoters", "pnl_store_salaries",
-     ["month", "party_name", "salary_name"], {
-        "month": "month",
-        "party name": "party_name", "erp name": "erp_name", "city": "city",
-        "promoter / tsi": "promoter_tsi", "designation": "designation",
-        "salary name": "salary_name", "firm": "firm",
-        "adj gross billing": "adj_gross_billing", "salary": "salary",
-        "salary split": "salary_split"}),
+    # "Salaries Stores & promoters" is NOT synced here since Birbal migration 132 (2026-10-02): the
+    # (month, party, salary name) key folded a person's stores into one row (April 7.68 L of 12.05 L),
+    # and salaries are confidential. sheet_grn_loader/staff_salary_loader.py loads the store grain,
+    # without names, from the Salary Detail sheet the Feeder tab copies.
 ]
 
 
@@ -337,8 +330,7 @@ def _feeder_tab(sheets, tab, keys, colmap):
                 rec[k] = None if v is None else str(v).strip()
             elif isinstance(v, str):
                 rec[k] = None                  # a stray label in a numeric cell
-        # dedupe on the target table's OWN key: the store-salary tab repeats a
-        # (party, salary name) pair across cities
+        # dedupe on the target table's OWN key
         key = tuple(rec.get(k) for k in keys)
         if any(v is None for v in key):
             continue
