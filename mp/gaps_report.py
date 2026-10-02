@@ -182,9 +182,15 @@ def duplicates_section(cur, today: date) -> tuple[List[str], int]:
                          + ") -- the load should have removed these; check the run log")
         if rest:
             issues += 1
-            lines.append(f"  {table}: {sum(n for _, n in rest):,} rows are lines that more than one "
-                         "file exports with different numbers (" + ", ".join(f"{m:%b %Y} {n:,}" for m, n in rest)
-                         + "). Which file is the final one? Until one is removed, totals count both.")
+            months = ", ".join(f"{m:%b %Y} {n:,}" for m, n in rest)
+            if table in dedupe.SUPERSEDE_TABLES:
+                lines.append(f"  {table}: {sum(n for _, n in rest):,} rows are lines restated by more than one "
+                             f"file ({months}) that the newest-file rule did not resolve -- its lines were "
+                             "not unique within a file there; check the run log.")
+            else:
+                lines.append(f"  {table}: {sum(n for _, n in rest):,} rows are lines that more than one "
+                             f"file exports with different numbers ({months}). Which file is the final "
+                             "one? Until one is removed, totals count both.")
     if not lines:
         lines.append(f"  No row is loaded twice in the last {LOOKBACK_DAYS} days.")
     return lines, issues

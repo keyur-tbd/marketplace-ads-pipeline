@@ -329,6 +329,14 @@ class Guard:
 
 def ensure_log_table(conn) -> None:
     cur = conn.cursor()
+    # DDL only when something is missing: several clean-up processes started together
+    # all ran `create ... if not exists` + `alter table` on it at once and deadlocked.
+    cur.execute("""select count(*) from information_schema.columns
+                   where table_schema = 'public' and table_name = %s and column_name = 'row_data'""",
+                (LOG_TABLE,))
+    if cur.fetchone()[0]:
+        conn.commit()
+        return
     for stmt in dbadmin.split_statements(log_table_ddl()):
         cur.execute(stmt)
     # Added after the first version of the table; harmless when already there.
