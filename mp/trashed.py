@@ -138,9 +138,14 @@ def reconcile(svc, index: dict, apply: bool = False, tables: Optional[List[str]]
                                          content_md5, kept_file_id, reason, row_data)
                                     select %s, t.id, t.drive_file_id, t.source_file, t.{dcol},
                                            {dedupe._content()}, null, %s, to_jsonb(t)
-                                    from public.{table} t where t.drive_file_id = %s""",
-                                (table, f"trashed in Drive, replaced (by {entry['by']})"[:200], fid))
-                    cur.execute(f"delete from public.{table} where drive_file_id = %s", (fid,))
+                                    from public.{table} t
+                                    where t.{dcol} between %s and %s and t.drive_file_id = %s""",
+                                (table, f"trashed in Drive, replaced (by {entry['by']})"[:200], lo, hi, fid))
+                    # The date range rides the date index; drive_file_id alone has no
+                    # index and scanned Instamart's 17M rows per file (~3 min each).
+                    # Every row of the file is dated (undated files are kept above).
+                    cur.execute(f"delete from public.{table} where {dcol} between %s and %s and drive_file_id = %s",
+                                (lo, hi, fid))
                     gone = cur.rowcount
                     cur.execute("delete from public.mp_loaded_files where table_name = %s and drive_file_id = %s",
                                 (table, fid))
