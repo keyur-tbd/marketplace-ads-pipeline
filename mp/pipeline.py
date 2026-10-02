@@ -465,6 +465,18 @@ def cmd_run(keys: Optional[List[str]], dry_run: bool, limit: Optional[int],
         results.append(run_source(s, sink, svc, index, types_by_table,
                                   dry_run, limit, since, reload_files, guard))
 
+    # Files trashed in Drive since we loaded them: their rows go once the file that
+    # replaced them (same folder, loaded after) covers their dates. mp/trashed.py.
+    # Report-only unless MP_TRASHED_APPLY=1 -- deleting is the data owner's switch.
+    if guard and guard.enabled:
+        try:
+            from . import trashed
+            apply = os.environ.get("MP_TRASHED_APPLY") == "1"
+            for line in trashed.report_lines(trashed.reconcile(svc, index, apply=apply)):
+                logger.info("[trashed]%s", line)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[trashed] reconcile failed: %s", exc)
+
     print("\n" + "=" * 100)
     print("DRY RUN - nothing written" if dry_run else "LOAD COMPLETE")
     print("=" * 100)

@@ -3,7 +3,7 @@
     python -m mp.gaps_report            # print it
     python -m mp.gaps_report --send     # print it and mail it (GAPS_MAIL_TO, comma separated)
 
-Run after the sync, so it describes what Supabase holds NOW. Five questions:
+Run after the sync, so it describes what Supabase holds NOW. Six questions:
 
   1. How far behind is each party's ADS feed, and which days inside the last 60 are missing?
   2. How far behind is each party's SECONDARY SALES (sell-out) feed?
@@ -12,6 +12,7 @@ Run after the sync, so it describes what Supabase holds NOW. Five questions:
      nagged about: a skipped file that nobody has touched since is a decision, not a gap.)
   4. Does what the parties' ad portals report still agree with what finance booked?
   5. Is any row loaded twice -- the same rows, or the same line restated, from more than one file?
+  6. Which loaded files were taken out of Drive and still count, waiting on a replacement?
 
 It only reads. It never raises into the workflow: a report that cannot be built says so in
 the mail rather than failing the sync it follows.
@@ -158,6 +159,20 @@ def portal_section(cur) -> tuple[List[str], int]:
     return lines, issues
 
 
+def trashed_section() -> tuple[List[str], int]:
+    """Loaded files no longer in Drive whose rows are still counted (mp/trashed.py).
+    The sync just before this mail already removed every trashed file whose replacement
+    had loaded, so what is left is waiting on a replacement, or vanished (sharing?)."""
+    from . import trashed
+    svc = drive.build_service()
+    open_items = [e for e in trashed.reconcile(svc, drive.load_index(svc), apply=False)
+                  if e["action"] not in ("no rows left",) and not e["action"].startswith("deleted")]
+    lines = trashed.report_lines(open_items)
+    if not lines:
+        lines = ["  None: every file removed from Drive has had its rows replaced."]
+    return lines, len(open_items)
+
+
 def duplicates_section(cur, today: date) -> tuple[List[str], int]:
     """Rows counted twice because more than one file carries them (mp/dedupe.py).
 
@@ -209,6 +224,7 @@ def build() -> tuple[str, str]:
             ("3. FILES: DRIVE AGAINST SUPABASE", files_section, (cur,)),
             ("4. PORTAL ADS AGAINST FINANCE", portal_section, (cur,)),
             ("5. ROWS LOADED TWICE (the same rows from more than one file)", duplicates_section, (cur, today)),
+            ("6. FILES TAKEN OUT OF DRIVE AFTER WE LOADED THEM", trashed_section, ()),
         ]:
             parts.append(title)
             try:
