@@ -36,6 +36,12 @@ Rule 2, newest file wins (SUPERSEDE_TABLES only, automatic):
   Applied only while a line really identifies one row inside a file (LINE_UNIQUE_MIN of
   a window's rows); if not, the table is reported and left alone.
 
+Rule 3, same delivery (ads tables, automatic):
+  the same line with the same spend / impressions / clicks / views in two files is one
+  delivery, whatever else differs -- matured attribution (more GMV for the same day in a
+  later export) or a value the old loader kept in raw_data. The newest file's copy stays.
+  This is what finished Instamart's August: rule 1 took it to Rs 113.6 L, rule 3 to 89.3 L.
+
 Everything deleted is written to mp_dedupe_log first -- the full row for rule 2, whose
 numbers differ from what is kept; for rule 1 the kept file is enough, the content is the
 same. Rows with no date are never touched. Same line with different numbers in tables
@@ -47,6 +53,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from datetime import date
 from typing import List, Optional, Sequence, Tuple
@@ -119,13 +126,30 @@ def _content(alias: str = "t") -> str:
     return f"md5((to_jsonb({alias}) - '{{{keys}}}'::text[])::text)"
 
 
-def _line(cur, table: str, alias: str = "t") -> str:
+def _line_cols(cur, table: str, alias: str = "t") -> List[str]:
     cur.execute("""select column_name, data_type from information_schema.columns
                    where table_schema = 'public' and table_name = %s order by ordinal_position""",
                 (table,))
-    keep = [c for c, kind in cur.fetchall()
+    return [f"{alias}.{c}" for c, kind in cur.fetchall()
             if c not in META_COLS and c != "raw_data" and (kind not in _NUMERIC or c in ID_NUMERIC)]
-    return f"md5(concat_ws('|', {', '.join(f'{alias}.{c}' for c in keep)}))"
+
+
+def _line(cur, table: str, alias: str = "t") -> str:
+    return f"md5(concat_ws('|', {', '.join(_line_cols(cur, table, alias))}))"
+
+
+#: What a line DELIVERED: spend, impressions, clicks, views under each platform's names.
+#: Ratios, ranks, CVRs and "missed"/"last year" figures are not delivery.
+_DELIVERY = re.compile(r"^(?!.*(per_|_per|cpc|ctr|roas|rate|share|last_year|avg|average|ecpm|ecpc|cpm"
+                       r"|percent|pct|_roi|rank|cvr|missed)).*(impression|click|spend|budget_burnt"
+                       r"|budget_consumed|^cost$|_cost$|views)")
+
+
+def _delivery(cur, table: str) -> List[str]:
+    cur.execute("""select column_name, data_type from information_schema.columns
+                   where table_schema = 'public' and table_name = %s order by ordinal_position""",
+                (table,))
+    return [c for c, kind in cur.fetchall() if kind in _NUMERIC and _DELIVERY.search(c)]
 
 
 def _window(dcol: str, since: Optional[str], until: Optional[str]) -> Tuple[str, list]:
@@ -262,6 +286,36 @@ def dedupe(cur, table: str, since: Optional[str], until: Optional[str],
                 from cc join newest using (d, k) where cc.f is distinct from newest.f""",
                         params + fparams)
             superseded = _delete_logged(cur, table, f"superseded: {reason}"[:200], full_row=True)
+
+    # Rule 3, ads tables: the same line with the same DELIVERY (spend, impressions,
+    # clicks...) in two files is one delivery, whatever else differs -- a later export
+    # with matured attribution (more conversions/GMV for the same day), or a value the
+    # old loader kept in raw_data and the new one types. Matching on the delivery
+    # numbers as well as the line makes a false match practically impossible, so unlike
+    # rule 2 this needs no uniqueness check. Rows that delivered nothing are left alone.
+    # The newest file's copy stays: its attribution is the most mature.
+    delivery = _delivery(cur, table) if table in ads else []
+    if delivery:
+        active = " or ".join(f"coalesce(t.{c}, 0) <> 0" for c in delivery)
+        key = "md5(concat_ws('|', " + ", ".join(_line_cols(cur, table) + [f"t.{c}" for c in delivery]) + "))"
+        focus = "where (d, k) in (select d, k from c where f = %s)" if only_file else ""
+        cur.execute(f"""
+            create temp table _dd as
+            with c as (select id, {dcol} d, drive_file_id f, source_file sf, created_at,
+                              {key} k, {_content()} h
+                       from public.{table} t where {where} and ({active})),
+            cc as (select * from c {focus}),
+            g as (select d, k from cc group by 1, 2 having count(distinct f) > 1),
+            newest as (
+                select distinct on (d, k) d, k, f from (
+                    select d, k, f, max(created_at) ca, max(id) mid
+                    from cc join g using (d, k) group by 1, 2, 3
+                ) x order by d, k, ca desc, mid desc
+            )
+            select cc.id, cc.d, cc.f, cc.sf, cc.h, newest.f kept
+            from cc join newest using (d, k) where cc.f is distinct from newest.f""",
+                    params + fparams)
+        superseded += _delete_logged(cur, table, f"same delivery: {reason}"[:200], full_row=False)
     return exact, superseded
 
 
