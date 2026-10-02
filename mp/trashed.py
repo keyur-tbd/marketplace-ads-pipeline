@@ -63,6 +63,17 @@ def _drive_status(svc, ids: List[str]) -> Dict[str, dict]:
     return out
 
 
+def _campaign_key(cur, table: str) -> Optional[str]:
+    """SQL for a row's campaign, whichever of these columns the export carries (Zepto's
+    exports renamed campaign_name to campaignname, so both exist with one null)."""
+    cur.execute("""select column_name from information_schema.columns
+                   where table_schema = 'public' and table_name = %s
+                     and column_name in ('campaign_id', 'campaign_name', 'campaignname')""", (table,))
+    present = {r[0] for r in cur.fetchall()}
+    cols = [f"t.{c}::text" for c in ("campaign_id", "campaign_name", "campaignname") if c in present]
+    return f"coalesce({', '.join(cols)})" if cols else None
+
+
 def reconcile(svc, index: dict, apply: bool = False, tables: Optional[List[str]] = None) -> List[dict]:
     """One entry per candidate file that is trashed or missing, with what was done."""
     live = {f["id"] for f in index["files"]}
@@ -106,32 +117,40 @@ def reconcile(svc, index: dict, apply: bool = False, tables: Optional[List[str]]
             dedupe.ensure_log_table(conn)
         for table, files in by_table.items():
             dcol = dedupe.date_column(cur, table)
-            if not dcol:
+            key = _campaign_key(cur, table)
+            if not dcol or not key:
+                for _, _, entry in files:
+                    entry["action"] = "kept: no date or campaign column to match a replacement on"
                 continue
-            ids = [f[0] for f in files]
-            # One pass over the table for every trashed file's dates; the replacement
-            # check per (file, date) then rides the date index.
-            cur.execute(f"""
-                with dead as (select fid, string_to_array(covers, ',') covers
-                              from unnest(%s::text[], %s::text[]) as u(fid, covers)),
-                f as (select drive_file_id fid, {dcol} d, count(*) n from public.{table}
-                      where drive_file_id = any(%s) group by 1, 2)
-                select f.fid, sum(f.n), count(f.d), count(*) > count(f.d), min(f.d), max(f.d),
-                       count(*) filter (where f.d is not null and exists (
-                           select 1 from public.{table} x
-                           where x.{dcol} = f.d and x.drive_file_id = any(dead.covers)))
-                from f join dead using (fid) group by 1""",
-                        (ids, [",".join(f[1]) for f in files], ids))
-            cover = {r[0]: r[1:] for r in cur.fetchall()}
+            # One scan of the table for every trashed file's rows (drive_file_id has no
+            # index; Instamart is 17M rows). Everything after works on this copy and
+            # reaches back into the table only by date, which is indexed.
+            cur.execute("drop table if exists _tf")
+            cur.execute(f"""create temp table _tf as
+                            select t.id, t.drive_file_id fid, t.{dcol} d, {key} k
+                            from public.{table} t where t.drive_file_id = any(%s)""",
+                        ([f[0] for f in files],))
+            xkey = key.replace("t.", "x.")
             for fid, covers, entry in files:
-                rows, dated, undated, lo, hi, covered = cover.get(fid, (0, 0, False, None, None, 0))
+                # Row by row: a row goes only when a replacement file has the SAME
+                # CAMPAIGN on the same date. Date coverage alone was not enough -- the
+                # Amazon 30-Sep export lacks campaign-days the 29-Sep one had, and
+                # deleting by date took Rs 6.6 L of real September spend with it.
+                cur.execute("drop table if exists _ok")
+                cur.execute(f"""create temp table _ok as
+                                select f.id from _tf f
+                                where f.fid = %s and f.d is not null and exists (
+                                    select 1 from public.{table} x
+                                    where x.{dcol} = f.d and x.drive_file_id = any(%s) and {xkey} = f.k)""",
+                            (fid, covers))
+                cur.execute("""select count(*), count(d), min(d), max(d),
+                                      (select count(*) from _ok) from _tf where fid = %s""", (fid,))
+                rows, dated, lo, hi, covered = cur.fetchone()
                 entry.update(rows=int(rows or 0), dates=f"{lo}..{hi}" if lo else "")
                 if not rows:
                     entry["action"] = "no rows left"
-                elif undated:
-                    entry["action"] = "kept: it has rows with no date to check a replacement against"
-                elif covered < dated:
-                    entry["action"] = f"kept: replacement not loaded for {dated - covered} of {dated} dates"
+                elif not covered:
+                    entry["action"] = "kept: no replacement has these campaigns on these dates yet"
                 elif apply:
                     cur.execute(f"""insert into public.{dedupe.LOG_TABLE}
                                         (table_name, deleted_id, drive_file_id, source_file, row_date,
@@ -139,20 +158,23 @@ def reconcile(svc, index: dict, apply: bool = False, tables: Optional[List[str]]
                                     select %s, t.id, t.drive_file_id, t.source_file, t.{dcol},
                                            {dedupe._content()}, null, %s, to_jsonb(t)
                                     from public.{table} t
-                                    where t.{dcol} between %s and %s and t.drive_file_id = %s""",
-                                (table, f"trashed in Drive, replaced (by {entry['by']})"[:200], lo, hi, fid))
-                    # The date range rides the date index; drive_file_id alone has no
-                    # index and scanned Instamart's 17M rows per file (~3 min each).
-                    # Every row of the file is dated (undated files are kept above).
-                    cur.execute(f"delete from public.{table} where {dcol} between %s and %s and drive_file_id = %s",
-                                (lo, hi, fid))
+                                    where t.{dcol} between %s and %s and t.id in (select id from _ok)""",
+                                (table, f"trashed in Drive, replaced (by {entry['by']})"[:200], lo, hi))
+                    cur.execute(f"""delete from public.{table} t
+                                    where t.{dcol} between %s and %s and t.id in (select id from _ok)""",
+                                (lo, hi))
                     gone = cur.rowcount
-                    cur.execute("delete from public.mp_loaded_files where table_name = %s and drive_file_id = %s",
-                                (table, fid))
+                    left = rows - gone
+                    if not left:
+                        # Restoring the file in Drive then makes the next run load it again.
+                        cur.execute("delete from public.mp_loaded_files where table_name = %s and drive_file_id = %s",
+                                    (table, fid))
                     conn.commit()
-                    entry["action"] = f"deleted {gone:,} rows"
+                    entry["action"] = f"deleted {gone:,} rows" + (
+                        f"; kept {left:,} whose campaign-day no replacement has" if left else "")
                 else:
-                    entry["action"] = "would delete (replacement loaded)"
+                    entry["action"] = (f"would delete {covered:,} rows"
+                                       + (f"; keep {rows - covered:,} with no replacement" if rows - covered else ""))
         return results
     finally:
         conn.close()
