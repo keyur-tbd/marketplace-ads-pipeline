@@ -84,6 +84,11 @@ jobs:
           # Runners have ~14 GB free. Files are deleted as we go so a month of
           # Instamart (~350 MB each) cannot accumulate into a full disk.
           MP_KEEP_CACHE: "0"
+          # After the load, retire the rows of files marketing trashed in Drive once a newer
+          # file in the same folder has loaded the same campaign-day (mp/trashed.py). Rows with
+          # no replacement are kept and listed in the gaps mail; files Drive cannot find are
+          # only reported. Turned on by the owner 2026-10-04.
+          MP_TRASHED_APPLY: "1"
           # The disk guard needs to reach Postgres directly - PostgREST cannot
           # report sizes. Same secrets the "Report table sizes" step uses.
           PGHOST: ${{ secrets.PGHOST }}
