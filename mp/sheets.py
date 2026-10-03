@@ -665,6 +665,67 @@ def load_capping_booked(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     return len(rows), ins, upd, f"{detail}, {gone} dropped"
 
 
+# --------------------------------------------------------------------------- #
+# Platform FOC and bills (Birbal migration 139)                               #
+# --------------------------------------------------------------------------- #
+
+# "Platform Wise FOC Amount" (owner harshil@): one tab per platform, month x bucket rows.
+# FOC is the platform's free-of-cost ad credit; the bill is what the brand actually paid.
+FOC_SHEET = os.environ.get("FOC_SHEET", "1RUoht5XkElx2Em3_OqswQplhBPh8NEZC1G-_5eWLtdo")
+FOC_SPEC = {"platform_raw": ["platform"], "month": ["month"], "bucket_raw": ["category"],
+            "foc_amount": ["foc amount"], "bill_amount": ["actual bill amount"],
+            "wallet_recharge": ["actual wallet recharge"]}
+FOC_PLATFORM = {"INSTAMART": "Instamart", "SWIGGY INSTAMART": "Instamart", "ZEPTO": "Zepto",
+                "BLINKIT": "Blinkit", "AMAZON": "Amazon", "FLIPKART": "Flipkart",
+                "BIG BASKET": "Big Basket", "BIGBASKET": "Big Basket"}
+# The sheet's three buckets. "BREADS" and "BREAD" are the same bucket (Apr-Jul vs Aug on).
+FOC_BUCKET = {"BREAD": "BREAD", "BREADS": "BREAD", "CHIPS": "CHIPS",
+              "NON BREAD": "NON BREADS", "NON BREADS": "NON BREADS", "NON-BREADS": "NON BREADS"}
+FOC_COLS = ["platform", "month", "bucket", "foc_amount", "bill_amount", "wallet_recharge", "source_tab"]
+
+
+def load_platform_foc(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    meta = sheets.spreadsheets().get(spreadsheetId=FOC_SHEET, fields="sheets.properties.title").execute()
+    rows: Dict[tuple, tuple] = {}
+    for tab in [s["properties"]["title"] for s in meta["sheets"]]:
+        grid = _grid(sheets, FOC_SHEET, tab, cols="F", rows=500)
+        if not grid:
+            continue
+        idx = _header_index(tab, grid[0], FOC_SPEC, optional=["wallet_recharge"])
+        for r in grid[1:]:
+            plat_raw = (_text(_cell(r, idx["platform_raw"])) or "").upper()
+            if not plat_raw:
+                continue
+            platform = FOC_PLATFORM.get(plat_raw)
+            bucket = FOC_BUCKET.get((_text(_cell(r, idx["bucket_raw"])) or "").upper())
+            month = _sales_month(_cell(r, idx["month"]))
+            if not platform or not bucket or not month:
+                # a new partner or bucket name would otherwise drop out of the MIS silently
+                raise ValueError(f"tab {tab!r}: cannot read row {r[:5]} "
+                                 f"(platform {platform}, bucket {bucket}, month {month})")
+            key = (platform, month, bucket)
+            if key in rows:
+                raise ValueError(f"tab {tab!r}: {key} appears twice")
+            # blank is NOT zero: no bill yet means "use the ads export less FOC"
+            wallet = _num(_cell(r, idx["wallet_recharge"])) if "wallet_recharge" in idx else None
+            rows[key] = (platform, month, bucket, _num(_cell(r, idx["foc_amount"])),
+                         _num(_cell(r, idx["bill_amount"])), wallet, tab)
+    months = sorted({k[1] for k in rows})
+    detail = (f"{len(rows)} platform x month x bucket rows, {months[0]}..{months[-1]}, "
+              f"{sum(1 for v in rows.values() if v[4] is not None)} with a bill") if rows else "empty"
+    if not write:
+        return len(rows), 0, 0, detail
+    ins, upd = merge(cur, "mp_platform_foc", FOC_COLS, ["platform", "month", "bucket"],
+                     list(rows.values()), "loaded_at")
+    gone = 0
+    if len(rows) >= 10:          # a half-read sheet must not empty the table
+        cur.execute("""delete from public.mp_platform_foc
+                       where (platform, month, bucket) not in (select * from unnest(%s::text[], %s::date[], %s::text[]))""",
+                    [[k[0] for k in rows], [k[1] for k in rows], [k[2] for k in rows]])
+        gone = cur.rowcount
+    return len(rows), ins, upd, f"{detail}, {gone} dropped"
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -679,6 +740,7 @@ SOURCES = [
     SheetSource("prn_bb", PRN_BB_SHEET, load_prn_bb),
     SheetSource("prn_nb", PRN_NB_SHEET, load_prn_nb),
     SheetSource("capping_booked", CAPPING_SHEET, load_capping_booked),
+    SheetSource("platform_foc", FOC_SHEET, load_platform_foc),
 ]
 
 
