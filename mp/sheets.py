@@ -4,7 +4,7 @@
     python -m mp.sheets --run                    # load every sheet that changed
     python -m mp.sheets --run --source pnl_feeder --force
 
-Six sheets, all read as marketing@thebakersdozen.in (the same token.json as
+The sheets below, all read as marketing@thebakersdozen.in (the same token.json as
 the Drive sync):
 
   campaign_master  "Ecom Campaign Master" (owned by instamart@, edited daily by
@@ -25,6 +25,12 @@ the Drive sync):
   capping_booked   finance's "ERP Capping RTV Data" (tabs FY26-27, FY25-26): each booked
                    capping-RTV credit memo and the sales month it settles (Birbal
                    migrations 036/044/075). -> rtv_capping_booked
+  mis_party_pnl    finance's Management MIS FY27, tab "Marketplace Party Break-up PnL":
+                   the month x party P&L lines, GMV to EBITDA. The Power BI marketplace P&L
+                   takes a month's costs from here while the Feeder File has not reached
+                   it (finance filled September 2026 here and not in the Feeder).
+                   -> powerbi.mp_mis_party_pnl (outside Birbal's migrations, created by
+                   powerbi_mp_pnl.sql in "Marketplace P&L Data to PowerBi")
 
 Incremental, in two layers:
 
@@ -133,8 +139,8 @@ def _cell(row: Sequence, i: int):
 # --------------------------------------------------------------------------- #
 
 def merge(cur, table: str, cols: List[str], keys: List[str], rows: List[tuple],
-          touch: str) -> Tuple[int, int]:
-    """Upsert rows into public.<table>; returns (inserted, updated).
+          touch: str, schema: str = "public") -> Tuple[int, int]:
+    """Upsert rows into <schema>.<table>; returns (inserted, updated).
 
     `touch` is the timestamp column set to now() on an UPDATE; an INSERT takes
     the table's default. A row identical to what is stored is not written.
@@ -143,7 +149,7 @@ def merge(cur, table: str, cols: List[str], keys: List[str], rows: List[tuple],
         return 0, 0
     collist = ", ".join(cols)
     cur.execute(f"drop table if exists _stg")
-    cur.execute(f"create temp table _stg as select {collist} from public.{table} limit 0")
+    cur.execute(f"create temp table _stg as select {collist} from {schema}.{table} limit 0")
     one = "(" + ", ".join(["%s"] * len(cols)) + ")"
     for i in range(0, len(rows), CHUNK):
         part = rows[i:i + CHUNK]
@@ -151,7 +157,7 @@ def merge(cur, table: str, cols: List[str], keys: List[str], rows: List[tuple],
                     [v for r in part for v in r])
     vals = [c for c in cols if c not in keys]
     cur.execute(
-        f"insert into public.{table} as t ({collist}) select {collist} from _stg "
+        f"insert into {schema}.{table} as t ({collist}) select {collist} from _stg "
         f"on conflict ({', '.join(keys)}) do update set "
         + ", ".join(f"{c} = excluded.{c}" for c in vals) + f", {touch} = now() "
         f"where ({', '.join('t.' + c for c in vals)}) is distinct from "
@@ -726,6 +732,92 @@ def load_platform_foc(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     return len(rows), ins, upd, f"{detail}, {gone} dropped"
 
 
+# --------------------------------------------------------------------------- #
+# Management MIS FY27: "Marketplace Party Break-up PnL"                       #
+# --------------------------------------------------------------------------- #
+
+# Finance's own month x party P&L. Row 3 opens each month block with the month (a serial) and names the
+# block's parties in the columns after it; column A labels the lines. Matched on the LABELS, never on row
+# numbers; the first occurrence above EBITDA wins ("Others" is the channel-spend line, the corporate
+# overheads' "Others" comes after it).
+MIS_SHEET = os.environ.get("MIS_SHEET", "1qT4atLhT0YRRtT6S-WsMmHspOiVnn22DBPkEoYUUwL4")
+MIS_TAB = "Marketplace Party Break-up PnL"
+MIS_HDR_ROW = 2                                # 0-indexed: row 3
+MIS_HEADS = {
+    "gmv": "gmv", "gross billing": "gross_billing", "adjusted gross billing": "adjusted_gross_billing",
+    "net sales": "net_sales", "cogs": "cogs", "material expenses": "material",
+    "manufacturing expenses": "manufacturing", "yield / wh loss": "yield_loss",
+    "gross margin": "gross_margin", "logistics cost": "logistics", "cm 1": "cm1",
+    "other marketing exp": "other_marketing_exp", "offers": "offers", "ads": "ads",
+    "others": "off_invoice", "salaries stores & promoters": "store_salaries",
+    "store operating costs": "store_operating_cost", "cm 2": "cm2",
+    "brand building cost": "brand_building", "cm 3": "cm3", "salary - corporate": "salary_corporate",
+    "salary - direct corporate": "salary_direct", "rent and utilities": "rent_utilities",
+    "corporate overheads": "corporate_overheads", "ebitda": "ebitda"}
+MIS_PARTY = {"blinkit": "Blinkit", "instamart": "Instamart", "zepto": "Zepto", "big basket": "Big Basket",
+             "amazon fresh": "Amazon Fresh", "aripl": "Aripl", "milk basket": "Milk Basket",
+             "flipkart supermart": "Flipkart Supermart", "flipkart quick": "Flipkart Quick",
+             "first club": "First Club", "dmart ready": "DMart Ready"}
+MIS_COLS = ["month", "party", "head", "amount"]
+
+
+def load_mis_party_pnl(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    grid = _grid(sheets, MIS_SHEET, MIS_TAB, cols="HZ", rows=120)
+    if len(grid) <= MIS_HDR_ROW:
+        raise ValueError(f"tab {MIS_TAB!r} is empty")
+    labels: Dict[str, int] = {}
+    for r, row in enumerate(grid):
+        lab = str(_cell(row, 0) or "").strip().lower()
+        if lab in MIS_HEADS and MIS_HEADS[lab] not in labels:
+            labels[MIS_HEADS[lab]] = r
+        if lab == "ebitda":
+            break
+    missing = set(MIS_HEADS.values()) - set(labels)
+    if missing:
+        raise ValueError(f"tab {MIS_TAB!r}: line labels changed, cannot find {', '.join(sorted(missing))}. "
+                         f"Refusing to load rather than read the wrong rows.")
+    hdr = grid[MIS_HDR_ROW]
+    rows: Dict[tuple, tuple] = {}
+    for i, v in enumerate(hdr):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue
+        month = EPOCH + dt.timedelta(days=int(v))
+        cols = []
+        j = i + 1
+        while j < len(hdr) and isinstance(hdr[j], str) and hdr[j].strip():
+            name = hdr[j].strip()
+            party = MIS_PARTY.get(name.lower())
+            if not party:
+                raise ValueError(f"tab {MIS_TAB!r}: unknown party {name!r} in the {month} block")
+            cols.append((j, party))
+            j += 1
+        block = {}
+        for head, r in labels.items():
+            for j, party in cols:
+                amt = _num(_cell(grid[r], j))
+                if amt is not None:
+                    block[(month, party, head)] = (month, party, head, round(amt, 2))
+        # the tab carries template blocks for months finance has not filled (all zero); skip them
+        if not any(abs(t[3]) > 0 for k, t in block.items() if k[2] == "net_sales"):
+            continue
+        if any(k[0] == month for k in rows):
+            raise ValueError(f"tab {MIS_TAB!r}: two filled blocks for {month}")
+        rows.update(block)
+    months = sorted({k[0] for k in rows})
+    detail = f"{len(rows)} month x party x head rows, {months[0]}..{months[-1]}" if rows else "empty"
+    if not write:
+        return len(rows), 0, 0, detail
+    ins, upd = merge(cur, "mp_mis_party_pnl", MIS_COLS, ["month", "party", "head"],
+                     list(rows.values()), "loaded_at", schema="powerbi")
+    gone = 0
+    if len(rows) >= 200:         # a half-read sheet must not empty the table
+        cur.execute("""delete from powerbi.mp_mis_party_pnl
+                       where (month, party, head) not in (select * from unnest(%s::date[], %s::text[], %s::text[]))""",
+                    [[k[0] for k in rows], [k[1] for k in rows], [k[2] for k in rows]])
+        gone = cur.rowcount
+    return len(rows), ins, upd, f"{detail}, {gone} dropped"
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -741,6 +833,7 @@ SOURCES = [
     SheetSource("prn_nb", PRN_NB_SHEET, load_prn_nb),
     SheetSource("capping_booked", CAPPING_SHEET, load_capping_booked),
     SheetSource("platform_foc", FOC_SHEET, load_platform_foc),
+    SheetSource("mis_party_pnl", MIS_SHEET, load_mis_party_pnl),
 ]
 
 
