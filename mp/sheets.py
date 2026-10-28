@@ -25,6 +25,11 @@ the Drive sync):
   capping_booked   finance's "ERP Capping RTV Data" (tabs FY26-27, FY25-26): each booked
                    capping-RTV credit memo and the sales month it settles (Birbal
                    migrations 036/044/075). -> rtv_capping_booked
+  mis_costs        the same Management MIS FY27: tabs City X Channel, Marketplace / Trade Party
+                   Break-up PnL and P&L FY27 Statement with Reco -> the six pnl_* cost tables for
+                   EVERY month finance has closed there (source = 'management_mis', Birbal 224). The
+                   MIS is finance's final word and runs ahead of the Feeder, so it replaces the
+                   Feeder's rows for those months and pnl_feeder no longer writes them.
   mis_party_pnl    finance's Management MIS FY27, tab "Marketplace Party Break-up PnL":
                    the month x party P&L lines, GMV to EBITDA. The Power BI marketplace P&L
                    takes a month's costs from here while the Feeder File has not reached
@@ -358,6 +363,10 @@ def load_feeder(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     ins = upd = 0
     detail = []
     for table, keys, cols, rows in parsed:
+        # a month the Management MIS has closed is its own (mis_costs, Birbal 224): never overwrite it
+        cur.execute(f"select distinct month from public.{table} where source = 'management_mis'")
+        owned = {r[0] for r in cur.fetchall()}
+        rows = [r for r in rows if r["month"] not in owned]
         i, u = merge(cur, table, cols, keys, [tuple(r[c] for c in cols) for r in rows],
                      touch="loaded_at")
         ins, upd = ins + i, upd + u
@@ -818,6 +827,254 @@ def load_mis_party_pnl(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
     return len(rows), ins, upd, f"{detail}, {gone} dropped"
 
 
+# --------------------------------------------------------------------------- #
+# Management MIS FY27 -> the six pnl_* cost tables (Birbal migration 224)     #
+# --------------------------------------------------------------------------- #
+# Finance closes a month in the Management MIS; the Feeder File lags it (September 2026 was never put in the
+# Feeder) and is restated by it. So for every month the MIS has filled, these rows REPLACE the Feeder's (source
+# = 'management_mis'), and load_feeder leaves that month alone. Four tabs, matched on their line LABELS (column A,
+# column B on the statement), never on row numbers:
+#   City X Channel                  a block of columns per month (its header serial carries the month, but a 2024
+#                                   year: the month NUMBER is taken and the year comes from the statement); in a
+#                                   block, one column per city (its total) and one per city x channel (that
+#                                   split of direct salary is a sales-weight spread, NOT finance's marketplace /
+#                                   trade split -- which the party tabs carry, so it is taken from there)
+#   Marketplace Party Break-up PnL  a block per month, one column per marketplace party
+#   Trade Party Break-up PnL        a block per month, one column per trade party, group subtotals among them
+#   P&L FY27 Statement with Reco    one column per month: the company totals every month is checked against
+MISC_CITY_TAB = "City X Channel"
+MISC_TRADE_TAB = "Trade Party Break-up PnL"
+MISC_STMT_TAB = "P&L FY27 Statement with Reco"
+MISC_HDR_LABEL = "channel p&l: business i"
+MISC_CITIES = ["Mumbai", "Pune", "Delhi NCR", "Hyderabad", "Bangalore", "Chennai", "Kolkata", "Ahmedabad",
+               "Vadodara", "Surat"]                  # the Feeder's own spellings, so both sources key alike
+MISC_CITY_LINES = {"net sales": "net_sales", "inter city": "inter", "intra city": "intra",
+                   "rent and utilities": "rent", "salary - corporate": "salary_corporate",
+                   "salary - direct corporate": "salary_direct", "corporate overheads": "corporate_overheads"}
+MISC_STMT_LINES = {"net sales": "net_sales", "outward logistics": "logistics", "channel spends": "channel_spends",
+                   "brand building costs": "brand_building", "consultancy & legal fees": "consultancy_legal",
+                   "travelling & conveyance": "travel_conveyance", "gst": "gst", "software exp": "software",
+                   "others": "others"}
+MISC_PARTY_LINES = {"net sales": "net_sales", "offers": "offers", "ads": "ads", "others": "other",
+                    "salary - direct corporate": "salary_direct"}
+MISC_TRADE_GROUPS = {"MTPREMIUM", "MTMASS", "DISTRIBUTOR", "GT"}          # subtotal columns in the trade blocks
+MISC_TRADE_ALIAS = {"NB": "NATURESBASKET", "RELIANCESIGNATURE": "RELIANCE", "RELIANCESMART": "RELIANCE",
+                    "METROCC": "RELIANCE", "GTS": "GT"}
+MISC_TOLERANCE = 1000.0                              # rupees: a month that misses the statement by more is refused
+
+
+def _k(s) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+
+def _label(v) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).strip().lower()
+
+
+def _first_rows(grid, col: int, wanted: Dict[str, str], stop: str = "ebitda") -> Dict[str, int]:
+    """{field: row} for each wanted label, its first occurrence above `stop`."""
+    out: Dict[str, int] = {}
+    for r, row in enumerate(grid):
+        lab = _label(_cell(row, col))
+        if lab in wanted and wanted[lab] not in out:
+            out[wanted[lab]] = r
+        if lab == stop:
+            break
+    return out
+
+
+def _serial_month(v) -> Optional[dt.date]:
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 40000:
+        return (EPOCH + dt.timedelta(days=int(v))).replace(day=1)
+    return None
+
+
+def _mis_statement(sheets) -> Dict[dt.date, Dict[str, float]]:
+    grid = _grid(sheets, MIS_SHEET, MISC_STMT_TAB, cols="AZ", rows=80)
+    rows = _first_rows(grid, 1, MISC_STMT_LINES)
+    missing = set(MISC_STMT_LINES.values()) - set(rows)
+    if missing:
+        raise ValueError(f"tab {MISC_STMT_TAB!r}: cannot find {', '.join(sorted(missing))}")
+    out = {}
+    for c, v in enumerate(grid[0]):
+        month = _serial_month(v)
+        if month:
+            vals = {f: _num(_cell(grid[r], c)) or 0.0 for f, r in rows.items()}
+            if vals["net_sales"] > 0:                # an open month is all zero
+                out[month] = vals
+    return out
+
+
+def _mis_city_blocks(sheets, by_number: Dict[int, dt.date]):
+    grid = _grid(sheets, MIS_SHEET, MISC_CITY_TAB, cols="AHZ", rows=80)
+    hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
+    if hr is None or hr < 2:
+        raise ValueError(f"tab {MISC_CITY_TAB!r}: header row not found")
+    rows = _first_rows(grid, 0, MISC_CITY_LINES)
+    missing = set(MISC_CITY_LINES.values()) - set(rows)
+    if missing:
+        raise ValueError(f"tab {MISC_CITY_TAB!r}: cannot find {', '.join(sorted(missing))}")
+    hdr, cityrow = grid[hr], grid[hr - 2]
+    val = lambda f, c: _num(_cell(grid[rows[f]], c)) or 0.0          # noqa: E731
+    out: Dict[dt.date, dict] = {}
+    month, inblock = None, False
+    for c, v in enumerate(hdr):
+        sm = _serial_month(v)
+        if sm:
+            month, inblock = by_number.get(sm.month), True
+            if month is not None:
+                if month in out:
+                    raise ValueError(f"tab {MISC_CITY_TAB!r}: two blocks for {month:%b %Y}")
+                out[month] = {"city": {}}
+            continue
+        if not inblock or month is None or not isinstance(v, str):
+            continue                                 # the YTD block before the first month, or an open month
+        name = re.sub(r"\s+", " ", v).strip()
+        b = out[month]
+        if name in MISC_CITIES and str(_cell(cityrow, c) or "").strip() == name:
+            b["city"][name] = {f: val(f, c) for f in MISC_CITY_LINES.values()}
+    return out
+
+
+def _mis_party_blocks(sheets, tab: str, trade_parties=None):
+    """{month: {party: {offers, ads, other, net_sales}}} for the filled blocks. A trade block skips its group
+    subtotals and names each party as Birbal does that month (else the sheet's own name)."""
+    grid = _grid(sheets, MIS_SHEET, tab, cols="KZ", rows=120)
+    hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
+    if hr is None:
+        raise ValueError(f"tab {tab!r}: header row not found")
+    rows = _first_rows(grid, 0, MISC_PARTY_LINES)
+    missing = set(MISC_PARTY_LINES.values()) - set(rows)
+    if missing:
+        raise ValueError(f"tab {tab!r}: cannot find {', '.join(sorted(missing))}")
+    blocks: List[Tuple[dt.date, Dict[str, Dict[str, float]]]] = []
+    for c, v in enumerate(grid[hr]):
+        sm = _serial_month(v)
+        if sm:
+            blocks.append((sm, {}))
+            continue
+        if not blocks or not isinstance(v, str) or not v.strip():
+            continue
+        month, blk = blocks[-1]
+        name = re.sub(r"\s+", " ", v).strip()
+        if trade_parties is not None:
+            k = _k(name)
+            if k in MISC_TRADE_GROUPS:
+                continue
+            known = trade_parties.get(month, {})
+            name = known.get(k) or known.get(MISC_TRADE_ALIAS.get(k, "")) or name
+        acc = blk.setdefault(name, {f: 0.0 for f in MISC_PARTY_LINES.values()})
+        for f, r in rows.items():
+            acc[f] += _num(_cell(grid[r], c)) or 0.0
+    out: Dict[dt.date, Dict[str, Dict[str, float]]] = {}
+    for month, blk in blocks:
+        if not any(abs(p["net_sales"]) > 0 for p in blk.values()):
+            continue                                 # template blocks for months finance has not filled
+        if month in out:
+            raise ValueError(f"tab {tab!r}: two filled blocks for {month:%b %Y}")
+        out[month] = blk
+    return out
+
+
+MISC_TABLES = [   # table, key columns, value columns
+    ("pnl_logistics_cost", ["month", "city"], ["inter", "intra"]),
+    ("pnl_rent_utilities", ["month", "city"], ["amount"]),
+    ("pnl_channel_spend", ["month", "party"], ["offers", "ads", "other"]),
+    ("pnl_brand_building", ["month"], ["brand_building", "salary_corporate"]),
+    ("pnl_salary_direct", ["month"], ["marketplace", "trade"]),
+    ("pnl_corporate_overhead", ["month"], ["gratuity_provision", "consultancy_legal", "travel_conveyance", "gst",
+                                           "software", "others"]),
+]
+
+
+def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
+    """{table: rows (keys + values)} for every month the MIS has closed, and a note per month."""
+    stmt = _mis_statement(sheets)
+    city = _mis_city_blocks(sheets, {m.month: m for m in stmt})
+    mkt = _mis_party_blocks(sheets, MIS_TAB)
+    cur.execute("select distinct month, party from warehouse.pnl_lines where business = 'TRADE' and party is not null")
+    trade_parties: Dict[dt.date, Dict[str, str]] = {}
+    for m, p in cur.fetchall():
+        trade_parties.setdefault(m, {})[_k(p)] = p
+    trade = _mis_party_blocks(sheets, MISC_TRADE_TAB, trade_parties)
+    out: Dict[str, List[tuple]] = {t: [] for t, _, _ in MISC_TABLES}
+    notes = []
+    r2 = lambda x: round(x, 2)                                                  # noqa: E731
+    for m in sorted(stmt):
+        s, cb = stmt[m], city.get(m)
+        if not cb or not cb["city"] or m not in mkt:
+            notes.append(f"{m:%b %Y}: not in every tab yet, left to the Feeder")
+            continue
+        cities = cb["city"]
+        tot = lambda f: sum(v[f] for v in cities.values())                      # noqa: E731
+        mk = mkt[m]
+        tr = {p: v for p, v in trade.get(m, {}).items() if any(abs(v[h]) > 0 for h in ("offers", "ads", "other"))}
+        spend = sum(v[h] for d in (mk, tr) for v in d.values() for h in ("offers", "ads", "other"))
+        checks = {"net sales": (tot("net_sales"), s["net_sales"]),
+                  "logistics": (tot("inter") + tot("intra"), s["logistics"]),
+                  "channel spends": (spend, s["channel_spends"])}
+        bad = [f"{k} {a:,.0f} vs statement {b:,.0f}" for k, (a, b) in checks.items() if abs(a - b) > MISC_TOLERANCE]
+        if bad:
+            raise ValueError(f"{m:%b %Y}: the tabs do not tie to the statement ({'; '.join(bad)}). Refusing to load.")
+        five = sum(s[h] for h in ("consultancy_legal", "travel_conveyance", "gst", "software", "others"))
+        for c, v in cities.items():
+            out["pnl_logistics_cost"].append((m, c, r2(v["inter"]), r2(v["intra"])))
+            out["pnl_rent_utilities"].append((m, c, r2(v["rent"])))
+        for p, v in list(mk.items()) + list(tr.items()):
+            out["pnl_channel_spend"].append((m, p, r2(v["offers"]), r2(v["ads"]), r2(v["other"])))
+        out["pnl_brand_building"].append((m, r2(s["brand_building"]), r2(tot("salary_corporate"))))
+        sd_mkt = sum(v["salary_direct"] for v in mk.values())
+        out["pnl_salary_direct"].append((m, r2(sd_mkt), r2(tot("salary_direct") - sd_mkt)))
+        out["pnl_corporate_overhead"].append((m, r2(tot("corporate_overheads") - five), r2(s["consultancy_legal"]),
+                                              r2(s["travel_conveyance"]), r2(s["gst"]), r2(s["software"]),
+                                              r2(s["others"])))
+        unplaced = sorted(p for p in tr if p not in trade_parties.get(m, {}).values())
+        notes.append(f"{m:%b %Y}: logistics {tot('inter') + tot('intra'):,.0f}, channel spends {spend:,.0f} "
+                     f"({len(mk)} marketplace + {len(tr)} trade parties"
+                     + (f"; not a Birbal trade party, so spread: {', '.join(unplaced)}" if unplaced else "") + ")")
+    return out, notes
+
+
+def _norm_row(r) -> tuple:
+    return tuple(round(float(x), 2) if x is not None and not isinstance(x, (str, dt.date)) else x for x in r)
+
+
+def load_mis_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    rows, notes = mis_cost_rows(sheets, cur)
+    for n in notes:
+        logger.info("  %s", n)
+    months = sorted({r[0] for r in rows["pnl_brand_building"]})
+    read = sum(len(v) for v in rows.values())
+    span = f"{len(months)} months" + (f" {months[0]}..{months[-1]}" if months else "")
+    if not write or not months:
+        return read, 0, 0, span
+    ins = gone_all = 0
+    detail = []
+    for table, keys, vals in MISC_TABLES:
+        cols = keys + vals
+        cur.execute(f"select {', '.join(cols)}, source from public.{table} where month = any(%s)", [months])
+        held: Dict[dt.date, set] = {}
+        for r in cur.fetchall():
+            held.setdefault(r[0], set()).add(_norm_row(r))
+        new: Dict[dt.date, set] = {}
+        for r in rows[table]:
+            new.setdefault(r[0], set()).add(_norm_row(tuple(r) + ("management_mis",)))
+        changed = [m for m in months if held.get(m, set()) != new.get(m, set())]
+        if not changed:
+            continue
+        cur.execute(f"delete from public.{table} where month = any(%s)", [changed])
+        gone = cur.rowcount
+        put = [tuple(r) + ("management_mis",) for r in rows[table] if r[0] in changed]
+        one = "(" + ", ".join(["%s"] * (len(cols) + 1)) + ")"
+        for i in range(0, len(put), CHUNK):
+            part = put[i:i + CHUNK]
+            cur.execute(f"insert into public.{table} ({', '.join(cols)}, source) values " + ", ".join([one] * len(part)),
+                        [v for r in part for v in r])
+        ins, gone_all = ins + len(put), gone_all + gone
+        detail.append(f"{table}: {len(changed)} months replaced (-{gone} +{len(put)})")
+    return read, ins, gone_all, f"{span}; " + ("; ".join(detail) or "no row changed")
+
+
 @dataclass
 class SheetSource:
     key: str
@@ -828,6 +1085,7 @@ class SheetSource:
 SOURCES = [
     SheetSource("campaign_master", CAMPAIGN_SHEET, load_campaign_master),
     SheetSource("pnl_feeder", FEEDER_SHEET, load_feeder),
+    SheetSource("mis_costs", MIS_SHEET, load_mis_costs),
     SheetSource("party_master", PARTY_MASTER_SHEET, load_party_master),
     SheetSource("prn_bb", PRN_BB_SHEET, load_prn_bb),
     SheetSource("prn_nb", PRN_NB_SHEET, load_prn_nb),
