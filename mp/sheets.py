@@ -29,7 +29,9 @@ the Drive sync):
                    Break-up PnL and P&L FY27 Statement with Reco -> the six pnl_* cost tables for
                    EVERY month finance has closed there (source = 'management_mis', Birbal 224). The
                    MIS is finance's final word and runs ahead of the Feeder, so it replaces the
-                   Feeder's rows for those months and pnl_feeder no longer writes them.
+                   Feeder's rows for those months and pnl_feeder no longer writes them. The
+                   statement's "-Yield Loss & WH Loss" goes to mis_yield_month (Birbal 233), which
+                   the MIS spreads over products.
   mis_party_pnl    finance's Management MIS FY27, tab "Marketplace Party Break-up PnL":
                    the month x party P&L lines, GMV to EBITDA. The Power BI marketplace P&L
                    takes a month's costs from here while the Feeder File has not reached
@@ -854,7 +856,7 @@ MISC_CITY_LINES = {"net sales": "net_sales", "inter city": "inter", "intra city"
 MISC_STMT_LINES = {"net sales": "net_sales", "outward logistics": "logistics", "channel spends": "channel_spends",
                    "brand building costs": "brand_building", "consultancy & legal fees": "consultancy_legal",
                    "travelling & conveyance": "travel_conveyance", "gst": "gst", "software exp": "software",
-                   "others": "others"}
+                   "others": "others", "-yield loss & wh loss": "yield_loss"}
 MISC_PARTY_LINES = {"net sales": "net_sales", "offers": "offers", "ads": "ads", "others": "other",
                     "salary - direct corporate": "salary_direct"}
 MISC_TRADE_GROUPS = {"MTPREMIUM", "MTMASS", "DISTRIBUTOR", "GT"}          # subtotal columns in the trade blocks
@@ -984,6 +986,7 @@ MISC_TABLES = [   # table, key columns, value columns
     ("pnl_salary_direct", ["month"], ["marketplace", "trade"]),
     ("pnl_corporate_overhead", ["month"], ["gratuity_provision", "consultancy_legal", "travel_conveyance", "gst",
                                            "software", "others"]),
+    ("mis_yield_month", ["month"], ["amount"]),                         # Birbal 233: split over products there
 ]
 
 
@@ -1028,6 +1031,7 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
         out["pnl_corporate_overhead"].append((m, r2(tot("corporate_overheads") - five), r2(s["consultancy_legal"]),
                                               r2(s["travel_conveyance"]), r2(s["gst"]), r2(s["software"]),
                                               r2(s["others"])))
+        out["mis_yield_month"].append((m, r2(s["yield_loss"])))
         unplaced = sorted(p for p in tr if p not in trade_parties.get(m, {}).values())
         notes.append(f"{m:%b %Y}: logistics {tot('inter') + tot('intra'):,.0f}, channel spends {spend:,.0f} "
                      f"({len(mk)} marketplace + {len(tr)} trade parties"
