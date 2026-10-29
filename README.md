@@ -313,8 +313,18 @@ Zepto is ~60% of the total on its own (~5M rows from 1,073 daily workbooks).
 
 ## Running it on GitHub Actions
 
-`.github/workflows/marketplace-sync.yml` runs the sync daily at 14:00 IST
-(08:30 UTC) and on demand.
+`.github/workflows/marketplace-sync.yml` runs the sync every 4 hours and on
+demand. Since 2026-10-29 it is **started by the database's clock, not GitHub's**:
+Supabase pg_cron job `mp-sync-dispatch` (`pg_cron_mp_sync_dispatch.sql`, applied
+by hand as postgres) POSTs a `workflow_dispatch` through pg_net at 03:00, 07:00,
+11:00, 15:00, 19:00 and 23:00 IST, and the 15:00 one asks for the data-gaps mail.
+GitHub honoured the workflow's own three-a-day schedule 4-6 hours late, so
+yesterday's sell-out files (uploaded ~10:00 IST) reached `mp_sales` after Birbal's
+13:30 IST sales-facts refresh and the boards ran two days behind. One GitHub
+schedule a day (12:30 UTC) stays as a fallback. The token is the ERP sync's vault
+secret `github_bc_sync_dispatch` (a keyur-tbd fine-grained token whose repository
+list must include this repo); every request lands in `public.mp_sync_dispatch_log`
+with GitHub's status (204 = accepted, 401/403/404 = token trouble).
 
 **Where does it get the files?** From the same Google Drive folder, over the
 Drive API. Drive is the source whether it runs here or on your laptop — nothing

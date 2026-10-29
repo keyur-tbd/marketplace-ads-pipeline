@@ -11,13 +11,18 @@ name: Market Place Data -> Supabase
 # it current.
 
 on:
+  # STARTED BY THE DATABASE, not by this schedule: Supabase pg_cron job mp-sync-dispatch
+  # (pg_cron_mp_sync_dispatch.sql) POSTs a workflow_dispatch every 4 hours -- 03:00, 07:00,
+  # 11:00, 15:00, 19:00, 23:00 IST -- and the 15:00 one asks for the data-gaps mail.
+  # GitHub honoured the old "30 5,9,12 UTC" schedule 4-6 hours late (first run of the day
+  # 15:13-16:59 IST over 24-28 Oct 2026), so yesterday's sell-out reached mp_sales only after
+  # Birbal's 13:30 IST sales-facts refresh and the boards ran two days behind. A dispatch
+  # starts in seconds. Each run loads only files the ledger has not seen -- or that were
+  # edited in Drive since we loaded them -- so a run costs a few minutes.
   schedule:
-    # Three times a day: 11:00, 15:00 and 18:00 IST (05:30, 09:30, 12:30 UTC).
-    # Each run loads only files the ledger has not seen -- or that were edited
-    # in Drive since we loaded them -- so a run costs a few minutes. GitHub can
-    # start a scheduled job late; the 15:00 run also sends the data-gaps mail.
-    - cron: "30 5 * * *"
-    - cron: "30 9 * * *"
+    # One fallback a day (18:00 IST, lands whenever GitHub gets to it) so the sync never
+    # stops altogether if the dispatch token expires (http_status 401/403/404 in
+    # public.mp_sync_dispatch_log). It does not send the gaps mail.
     - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
@@ -108,9 +113,10 @@ jobs:
           # cannot finish inside a job.
           python -m mp.pipeline --run $ARGS
 
-      - name: Email the data gaps (15:00 IST run, or on request)
-        # After the sync, so the mail describes what Supabase holds NOW.
-        if: always() && (github.event.schedule == '30 9 * * *' || github.event.inputs.send_gaps_mail == 'true')
+      - name: Email the data gaps (the 15:00 IST dispatch, or on request)
+        # After the sync, so the mail describes what Supabase holds NOW. pg_cron passes
+        # send_gaps_mail=true on its 15:00 IST dispatch only; the fallback schedule never mails.
+        if: always() && github.event.inputs.send_gaps_mail == 'true'
         env:
           PGHOST: ${{ secrets.PGHOST }}
           PGPORT: ${{ secrets.PGPORT }}
