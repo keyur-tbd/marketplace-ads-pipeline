@@ -113,6 +113,18 @@ jobs:
           # cannot finish inside a job.
           python -m mp.pipeline --run $ARGS
 
+      - name: Platform stock on hand (Platform Wise SOH Data -> mp_soh, Birbal 237)
+        # Its own Drive folder and ledger (public.mp_soh_files), so it runs whatever the sales/ads
+        # sync did. Reads only files new or edited since the last run: a few seconds most runs.
+        if: always() && github.event.inputs.dry_run != 'true'
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: python -m mp.soh --run
+
       - name: Email the data gaps (the 15:00 IST dispatch, or on request)
         # After the sync, so the mail describes what Supabase holds NOW. pg_cron passes
         # send_gaps_mail=true on its 15:00 IST dispatch only; the fallback schedule never mails.
