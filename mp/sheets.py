@@ -31,7 +31,9 @@ the Drive sync):
                    MIS is finance's final word and runs ahead of the Feeder, so it replaces the
                    Feeder's rows for those months and pnl_feeder no longer writes them. The
                    statement's "-Yield Loss & WH Loss" goes to mis_yield_month (Birbal 233), which
-                   the MIS spreads over products.
+                   the MIS spreads over products. A month is closed once the statement carries both
+                   logistics and channel spends; until then it is skipped. A closed month that does
+                   not tie is refused on its own: the others load and the source stays failed.
   mis_party_pnl    finance's Management MIS FY27, tab "Marketplace Party Break-up PnL":
                    the month x party P&L lines, GMV to EBITDA. The Power BI marketplace P&L
                    takes a month's costs from here while the Feeder File has not reached
@@ -863,6 +865,7 @@ MISC_TRADE_GROUPS = {"MTPREMIUM", "MTMASS", "DISTRIBUTOR", "GT"}          # subt
 MISC_TRADE_ALIAS = {"NB": "NATURESBASKET", "RELIANCESIGNATURE": "RELIANCE", "RELIANCESMART": "RELIANCE",
                     "METROCC": "RELIANCE", "GTS": "GT"}
 MISC_TOLERANCE = 1000.0                              # rupees: a month that misses the statement by more is refused
+MISC_CLOSED_LINES = ("logistics", "channel_spends")  # a month is closed once the statement carries both
 
 
 def _k(s) -> str:
@@ -990,8 +993,13 @@ MISC_TABLES = [   # table, key columns, value columns
 ]
 
 
-def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
-    """{table: rows (keys + values)} for every month the MIS has closed, and a note per month."""
+class PartialLoad(Exception):
+    """The months that tied are written; the source still failed, and is read again next run."""
+
+
+def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str], List[str]]:
+    """{table: rows (keys + values)} for every month the MIS has closed, a note per month, and the closed
+    months that do not tie to the statement (their rows are left out, so they keep what they had)."""
     stmt = _mis_statement(sheets)
     city = _mis_city_blocks(sheets, {m.month: m for m in stmt})
     mkt = _mis_party_blocks(sheets, MIS_TAB)
@@ -1001,10 +1009,14 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
         trade_parties.setdefault(m, {})[_k(p)] = p
     trade = _mis_party_blocks(sheets, MISC_TRADE_TAB, trade_parties)
     out: Dict[str, List[tuple]] = {t: [] for t, _, _ in MISC_TABLES}
-    notes = []
+    notes, refused = [], []
     r2 = lambda x: round(x, 2)                                                  # noqa: E731
     for m in sorted(stmt):
         s, cb = stmt[m], city.get(m)
+        blank = [h for h in MISC_CLOSED_LINES if not s[h]]
+        if blank:                                # finance fills net sales first, the tabs and costs over days
+            notes.append(f"{m:%b %Y}: still open, the statement has no {' or '.join(blank)} yet, left to the Feeder")
+            continue
         if not cb or not cb["city"] or m not in mkt:
             notes.append(f"{m:%b %Y}: not in every tab yet, left to the Feeder")
             continue
@@ -1018,7 +1030,8 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
                   "channel spends": (spend, s["channel_spends"])}
         bad = [f"{k} {a:,.0f} vs statement {b:,.0f}" for k, (a, b) in checks.items() if abs(a - b) > MISC_TOLERANCE]
         if bad:
-            raise ValueError(f"{m:%b %Y}: the tabs do not tie to the statement ({'; '.join(bad)}). Refusing to load.")
+            refused.append(f"{m:%b %Y}: the tabs do not tie to the statement ({'; '.join(bad)})")
+            continue
         five = sum(s[h] for h in ("consultancy_legal", "travel_conveyance", "gst", "software", "others"))
         for c, v in cities.items():
             out["pnl_logistics_cost"].append((m, c, r2(v["inter"]), r2(v["intra"])))
@@ -1036,7 +1049,7 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str]]:
         notes.append(f"{m:%b %Y}: logistics {tot('inter') + tot('intra'):,.0f}, channel spends {spend:,.0f} "
                      f"({len(mk)} marketplace + {len(tr)} trade parties"
                      + (f"; not a Birbal trade party, so spread: {', '.join(unplaced)}" if unplaced else "") + ")")
-    return out, notes
+    return out, notes, refused
 
 
 def _norm_row(r) -> tuple:
@@ -1044,17 +1057,15 @@ def _norm_row(r) -> tuple:
 
 
 def load_mis_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    rows, notes = mis_cost_rows(sheets, cur)
+    rows, notes, refused = mis_cost_rows(sheets, cur)
     for n in notes:
         logger.info("  %s", n)
     months = sorted({r[0] for r in rows["pnl_brand_building"]})
     read = sum(len(v) for v in rows.values())
     span = f"{len(months)} months" + (f" {months[0]}..{months[-1]}" if months else "")
-    if not write or not months:
-        return read, 0, 0, span
     ins = gone_all = 0
     detail = []
-    for table, keys, vals in MISC_TABLES:
+    for table, keys, vals in MISC_TABLES if write and months else ():
         cols = keys + vals
         cur.execute(f"select {', '.join(cols)}, source from public.{table} where month = any(%s)", [months])
         held: Dict[dt.date, set] = {}
@@ -1076,6 +1087,10 @@ def load_mis_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
                         [v for r in part for v in r])
         ins, gone_all = ins + len(put), gone_all + gone
         detail.append(f"{table}: {len(changed)} months replaced (-{gone} +{len(put)})")
+    if refused:
+        raise PartialLoad(f"{'; '.join(refused)}. Those months keep what they had; {span} went through.")
+    if not write or not months:
+        return read, 0, 0, span
     return read, ins, gone_all, f"{span}; " + ("; ".join(detail) or "no row changed")
 
 
@@ -1137,6 +1152,10 @@ def run(keys: Sequence[str], write: bool, force: bool) -> int:
             conn.commit()
             logger.info("%s: read %d, inserted %d, updated %d (%s)",
                         src.key, read, ins, upd, detail)
+        except PartialLoad as exc:               # no sync state: the run stays red until the month ties
+            conn.commit() if write else conn.rollback()
+            failures += 1
+            logger.error("%s: FAILED for some months: %s", src.key, exc)
         except Exception as exc:                 # one bad sheet must not stop the other
             conn.rollback()
             failures += 1
