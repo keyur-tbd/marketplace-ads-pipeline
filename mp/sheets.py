@@ -122,10 +122,26 @@ def _modified_time(drive, sheet_id: str) -> dt.datetime:
     return dt.datetime.fromisoformat(meta["modifiedTime"].replace("Z", "+00:00"))
 
 
-def _grid(sheets, sheet_id: str, tab: str, cols: str = "AZ", rows: int = 20000):
-    return sheets.spreadsheets().values().get(
+MIS_WIDE = "AZZ"     # 1,378 columns: the Management MIS tabs grow a month block to the right every month
+
+
+def _col_count(cols: str) -> int:
+    n = 0
+    for ch in cols:
+        n = n * 26 + ord(ch.upper()) - 64
+    return n
+
+
+def _grid(sheets, sheet_id: str, tab: str, cols: str = "AZ", rows: int = 20000, fit: bool = False):
+    """fit=True: refuse a tab that has data in the last column read. The API drops trailing blanks, so a row
+    that long means the tab may carry more to the right, and reading on would silently drop it (2026-11-16:
+    the Trade party tab grew past KZ and October lost Metro C&C and Sampoorna's spends)."""
+    grid = sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"'{tab}'!A1:{cols}{rows}",
         valueRenderOption="UNFORMATTED_VALUE").execute(num_retries=2).get("values", [])
+    if fit and any(len(r) >= _col_count(cols) for r in grid):
+        raise ValueError(f"tab {tab!r} has data in column {cols}, the last one read; widen the read")
+    return grid
 
 
 def _header_index(tab: str, header: Sequence, spec: Dict[str, Sequence[str]],
@@ -696,7 +712,7 @@ MIS_COLS = ["month", "party", "head", "amount"]
 
 
 def load_mis_party_pnl(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    grid = _grid(sheets, MIS_SHEET, MIS_TAB, cols="HZ", rows=120)
+    grid = _grid(sheets, MIS_SHEET, MIS_TAB, cols=MIS_WIDE, rows=120, fit=True)
     if len(grid) <= MIS_HDR_ROW:
         raise ValueError(f"tab {MIS_TAB!r} is empty")
     labels: Dict[str, int] = {}
@@ -824,7 +840,7 @@ def _serial_month(v) -> Optional[dt.date]:
 
 
 def _mis_statement(sheets) -> Dict[dt.date, Dict[str, float]]:
-    grid = _grid(sheets, MIS_SHEET, MISC_STMT_TAB, cols="AZ", rows=80)
+    grid = _grid(sheets, MIS_SHEET, MISC_STMT_TAB, cols="AZ", rows=80, fit=True)
     rows = _first_rows(grid, 1, MISC_STMT_LINES)
     missing = set(MISC_STMT_LINES.values()) - set(rows)
     if missing:
@@ -840,7 +856,7 @@ def _mis_statement(sheets) -> Dict[dt.date, Dict[str, float]]:
 
 
 def _mis_city_blocks(sheets, by_number: Dict[int, dt.date]):
-    grid = _grid(sheets, MIS_SHEET, MISC_CITY_TAB, cols="AHZ", rows=80)
+    grid = _grid(sheets, MIS_SHEET, MISC_CITY_TAB, cols=MIS_WIDE, rows=80, fit=True)
     hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
     if hr is None or hr < 2:
         raise ValueError(f"tab {MISC_CITY_TAB!r}: header row not found")
@@ -873,7 +889,7 @@ def _mis_city_blocks(sheets, by_number: Dict[int, dt.date]):
 def _mis_party_blocks(sheets, tab: str, trade_parties=None):
     """{month: {party: {offers, ads, other, net_sales}}} for the filled blocks. A trade block skips its group
     subtotals and names each party as Birbal does that month (else the sheet's own name)."""
-    grid = _grid(sheets, MIS_SHEET, tab, cols="KZ", rows=120)
+    grid = _grid(sheets, MIS_SHEET, tab, cols=MIS_WIDE, rows=120, fit=True)
     hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
     if hr is None:
         raise ValueError(f"tab {tab!r}: header row not found")
@@ -1155,7 +1171,7 @@ def _misl_rows(grid, col: int = 0) -> Dict[str, int]:
 
 
 def _misl_channel(sheets) -> List[tuple]:
-    grid = _grid(sheets, MIS_SHEET, MISL_CHANNEL_TAB, cols="MZ", rows=120)
+    grid = _grid(sheets, MIS_SHEET, MISL_CHANNEL_TAB, cols=MIS_WIDE, rows=120, fit=True)
     hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
     if hr is None or hr < 2:
         raise ValueError(f"tab {MISL_CHANNEL_TAB!r}: header row not found")
@@ -1184,7 +1200,7 @@ def _misl_channel(sheets) -> List[tuple]:
 
 
 def _misl_party(sheets, tab: str, channel: str) -> List[tuple]:
-    grid = _grid(sheets, MIS_SHEET, tab, cols="NZ", rows=120)
+    grid = _grid(sheets, MIS_SHEET, tab, cols=MIS_WIDE, rows=120, fit=True)
     hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
     if hr is None:
         raise ValueError(f"tab {tab!r}: header row not found")
@@ -1262,7 +1278,7 @@ PLANT_ROW_TOTAL, PLANT_ROW_PER_UNIT, PLANT_ROW_UNITS = 2, 3, 4
 
 
 def load_plant_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    grid = _grid(sheets, PLANT_SHEET, PLANT_TAB, cols="BZ", rows=30)
+    grid = _grid(sheets, PLANT_SHEET, PLANT_TAB, cols="BZ", rows=30, fit=True)
     if len(grid) <= PLANT_ROW_UNITS or _label(_cell(grid[PLANT_ROW_UNITS], 0)) != "comm units":
         raise ValueError(f"tab {PLANT_TAB!r}: row {PLANT_ROW_UNITS + 1} is not 'Comm Units'; the layout changed, "
                          f"refusing to read shifted rows")
@@ -1344,7 +1360,7 @@ def _salary_parse(g):
 
 
 def load_mis_direct_salary(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    g = _grid(sheets, MIS_SHEET, MIS_TAB, cols="GZ", rows=170)
+    g = _grid(sheets, MIS_SHEET, MIS_TAB, cols=MIS_WIDE, rows=170, fit=True)
     salaries, flags, alloc = _salary_parse(g)
     months = sorted({m for m, _ in salaries})
     detail = ", ".join(f"{m:%b %y} {sum(v for (mm, _), v in salaries.items() if mm == m):,.0f}"
