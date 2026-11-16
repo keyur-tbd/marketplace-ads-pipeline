@@ -2,7 +2,7 @@
 
     python -m mp.sheets --check                  # read + parse, write nothing
     python -m mp.sheets --run                    # load every sheet that changed
-    python -m mp.sheets --run --source pnl_feeder --force
+    python -m mp.sheets --run --source mis_costs --force
 
 The sheets below, all read as marketing@thebakersdozen.in (the same token.json as
 the Drive sync):
@@ -11,8 +11,8 @@ the Drive sync):
                    the ecom team): each marketplace ads campaign -> the SKU or ALL
                    group it advertises. Keys the P&L's ads onto products
                    (Birbal migration 066). -> ref_ads_campaign, ref_ads_name_map
-  pnl_feeder       the P&L "Feeder File": the below-gross-margin costs by month
-                   (Birbal migration 045). -> six pnl_* tables (store salaries: staff_salary_loader, 132)
+  (pnl_feeder)     RETIRED 2026-11-16: the P&L "Feeder File" is no longer read; finance's
+                   Management MIS (mis_costs) is the only source of the below-gross-margin costs.
   party_master     the party sheet's "Customer Location & Route MASTER" tab:
                    ship-to name -> the party the business calls it (Amazon Fresh,
                    Reliance Signature, Ratnadeep, GT ...). Every Birbal board
@@ -28,18 +28,26 @@ the Drive sync):
   mis_costs        the same Management MIS FY27: tabs City X Channel, Marketplace / Trade Party
                    Break-up PnL and P&L FY27 Statement with Reco -> the six pnl_* cost tables for
                    EVERY month finance has closed there (source = 'management_mis', Birbal 224). The
-                   MIS is finance's final word and runs ahead of the Feeder, so it replaces the
-                   Feeder's rows for those months and pnl_feeder no longer writes them. The
                    statement's "-Yield Loss & WH Loss" goes to mis_yield_month (Birbal 233), which
                    the MIS spreads over products. A month is closed once the statement carries both
-                   logistics and channel spends; until then it is skipped. A closed month that does
-                   not tie is refused on its own: the others load and the source stays failed.
+                   logistics and channel spends; until then it is skipped (provisional on the board).
+                   A closed month whose tabs do not add up to the statement is loaded with its city /
+                   party split SCALED to the statement (Birbal 255); every check goes to
+                   mis_costs_tieout. Only a month whose tabs are empty for a line is refused.
   mis_party_pnl    finance's Management MIS FY27, tab "Marketplace Party Break-up PnL":
                    the month x party P&L lines, GMV to EBITDA. The Power BI marketplace P&L
                    takes a month's costs from here while the Feeder File has not reached
                    it (finance filled September 2026 here and not in the Feeder).
                    -> powerbi.mp_mis_party_pnl (outside Birbal's migrations, created by
                    powerbi_mp_pnl.sql in "Marketplace P&L Data to PowerBi")
+  mis_lines        the same Management MIS: "YTD Channelwise" (company + channel) and the two
+                   Party Break-up tabs, every line GMV to EBITDA -> mis_mgmt_lines, which the
+                   /mis board's "vs Management MIS" reco compares with Birbal (Birbal 255)
+  mis_direct_salary the same Management MIS, the party tab's direct-salary working area: salary
+                   per employee and the channels each is flagged on -> pnl_direct_salary(+_platform)
+                   (was the manual cogs_pipeline/load_pnl_salary.py; a month is replaced whole)
+  plant_costs      "Department Targets", tab "Plant Costs FY 27", Actual (finance): the month's
+                   plant cost -> mfg_expense_month (was the manual cogs_pipeline/load_mfg_expense.py)
 
 Incremental, in two layers:
 
@@ -282,101 +290,14 @@ def load_campaign_master(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
 
 
 # --------------------------------------------------------------------------- #
-# The P&L Feeder File                                                         #
+# The P&L Feeder File: RETIRED 2026-11-16                                     #
 # --------------------------------------------------------------------------- #
-
-FEEDER_SHEET = "1NScaI-YVRVJTvsSo01dd60GiRlk5B9v6_Vf4qSSWjSY"
-FEEDER_TEXT = {"city", "party"}
-
-# tab -> (target table, key columns, {sheet header (lowercased) -> db column})
-FEEDER_TABS = [
-    ("Corporate Overheads", "pnl_corporate_overhead", ["month"], {
-        "month": "month", "provision for gratuity & pl": "gratuity_provision",
-        "consultancy & legal fees": "consultancy_legal",
-        "travelling & conveyance": "travel_conveyance",
-        "gst": "gst", "software exp": "software", "others": "others"}),
-    ("Logistics Cost", "pnl_logistics_cost", ["month", "city"], {
-        "month": "month", "city": "city", "inter": "inter", "intra": "intra"}),
-    ("Channel Spends", "pnl_channel_spend", ["month", "party"], {
-        "month": "month", "party": "party", "offers": "offers",
-        "ads": "ads", "other": "other"}),
-    ("Brand Building costs & Salary", "pnl_brand_building", ["month"], {
-        "month": "month", "brand building costs": "brand_building",
-        "salary - corporate": "salary_corporate"}),
-    ("Salary Direct", "pnl_salary_direct", ["month"], {
-        "month": "month", "marketplace": "marketplace", "trade": "trade"}),
-    ("Rent and Utilities", "pnl_rent_utilities", ["month", "city"], {
-        "month": "month", "city": "city", "amount": "amount"}),
-    # "Salaries Stores & promoters" is NOT synced here since Birbal migration 132 (2026-10-02): the
-    # (month, party, salary name) key folded a person's stores into one row (April 7.68 L of 12.05 L),
-    # and salaries are confidential. sheet_grn_loader/staff_salary_loader.py loads the store grain,
-    # without names, from the Salary Detail sheet the Feeder tab copies.
-]
-
-
-def _feeder_tab(sheets, tab, keys, colmap):
-    grid = _grid(sheets, FEEDER_SHEET, tab, "AZ", 2000)
-    if not grid:
-        raise ValueError(f"tab {tab!r} is empty")
-    hdr = [str(h).strip().lower() for h in grid[0]]
-    idx = {}
-    for i, h in enumerate(hdr):
-        if h in colmap and colmap[h] not in idx:
-            idx[colmap[h]] = i
-    missing = set(colmap.values()) - set(idx)
-    if missing:
-        raise ValueError(
-            f"tab {tab!r}: headers changed, cannot find {', '.join(sorted(missing))} "
-            f"(saw: {', '.join(hdr[:12])}). Refusing to load rather than write "
-            f"shifted columns.")
-    cols = list(idx)
-    out = {}
-    for row in grid[1:]:
-        rec = {c: _cell(row, idx[c]) for c in cols}
-        if rec.get("month") in (None, ""):
-            continue
-        if not isinstance(rec["month"], (int, float)):
-            raise ValueError(f"tab {tab!r}: month {rec['month']!r} is not a serial number")
-        rec["month"] = EPOCH + dt.timedelta(days=int(rec["month"]))
-        for k, v in list(rec.items()):
-            if v == "":
-                rec[k] = None
-            elif k in FEEDER_TEXT:
-                rec[k] = None if v is None else str(v).strip()
-            elif isinstance(v, str):
-                rec[k] = None                  # a stray label in a numeric cell
-        # dedupe on the target table's OWN key
-        key = tuple(rec.get(k) for k in keys)
-        if any(v is None for v in key):
-            continue
-        out[key] = rec
-    return cols, list(out.values())
-
-
-def load_feeder(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    parsed = []
-    for tab, table, keys, colmap in FEEDER_TABS:
-        cols, rows = _feeder_tab(sheets, tab, keys, colmap)
-        months = sorted({r["month"] for r in rows})
-        span = f"{months[0]}..{months[-1]}" if months else "empty"
-        logger.info("  %-32s -> %-24s %4d rows  %s", tab, table, len(rows), span)
-        parsed.append((table, keys, cols, rows))
-    read = sum(len(p[3]) for p in parsed)
-    if not write:
-        return read, 0, 0, ""
-    ins = upd = 0
-    detail = []
-    for table, keys, cols, rows in parsed:
-        # a month the Management MIS has closed is its own (mis_costs, Birbal 224): never overwrite it
-        cur.execute(f"select distinct month from public.{table} where source = 'management_mis'")
-        owned = {r[0] for r in cur.fetchall()}
-        rows = [r for r in rows if r["month"] not in owned]
-        i, u = merge(cur, table, cols, keys, [tuple(r[c] for c in cols) for r in rows],
-                     touch="loaded_at")
-        ins, upd = ins + i, upd + u
-        if i or u:
-            detail.append(f"{table} +{i} ~{u}")
-    return read, ins, upd, ", ".join(detail) or "no row changed"
+# The Feeder File (1NScaI-YVRVJTvsSo01dd60GiRlk5B9v6_Vf4qSSWjSY) is no longer read. Owner, 2026-11-16: everyone had to
+# re-fill it every month, previous months included, because finance keeps restating them; finance's Management MIS
+# FY27 is the single source of the below-gross-margin costs (mis_costs below). Every pnl_* cost row since Apr 2026
+# was already source = 'management_mis' when it was retired, so nothing it wrote is still in use. A month finance has
+# not closed in the MIS carries no Feeder costs: the board marks it provisional (Birbal 255).
+# cogs_pipeline/load_pnl_feeder.py is the old manual loader; do not run it.
 
 
 # --------------------------------------------------------------------------- #
@@ -834,10 +755,10 @@ def load_mis_party_pnl(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
 # --------------------------------------------------------------------------- #
 # Management MIS FY27 -> the six pnl_* cost tables (Birbal migration 224)     #
 # --------------------------------------------------------------------------- #
-# Finance closes a month in the Management MIS; the Feeder File lags it (September 2026 was never put in the
-# Feeder) and is restated by it. So for every month the MIS has filled, these rows REPLACE the Feeder's (source
-# = 'management_mis'), and load_feeder leaves that month alone. Four tabs, matched on their line LABELS (column A,
-# column B on the statement), never on row numbers:
+# Finance closes a month in the Management MIS, and restates closed months in place. For every month it has closed,
+# these rows are the six pnl_* cost tables' (source = 'management_mis'); since 2026-11-16 nothing else writes them (the
+# Feeder File is retired). Four tabs, matched on their line LABELS (column A, column B on the statement), never on
+# row numbers:
 #   City X Channel                  a block of columns per month (its header serial carries the month, but a 2024
 #                                   year: the month NUMBER is taken and the year comes from the statement); in a
 #                                   block, one column per city (its total) and one per city x channel (that
@@ -846,6 +767,13 @@ def load_mis_party_pnl(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
 #   Marketplace Party Break-up PnL  a block per month, one column per marketplace party
 #   Trade Party Break-up PnL        a block per month, one column per trade party, group subtotals among them
 #   P&L FY27 Statement with Reco    one column per month: the company totals every month is checked against
+# The statement is finance's final word. When a closed month's tabs do not add up to it (Oct 2026: the party tabs'
+# channel spends Rs 51,291 short of the statement), the split the tabs give is SCALED to the statement (owner,
+# 2026-11-16): intracity and intercity each to their own statement line, channel spends to the statement's total,
+# the rounding paise put on the largest row so the month ties to the paisa. Every check, scaled or not, is written to
+# public.mis_costs_tieout so the /mis reco shows how far finance's own tabs were off. Net sales is checked and
+# recorded but scales nothing (no cost is derived from it). A month whose tabs carry NOTHING for a line the statement
+# has cannot be split, and is refused alone as before.
 MISC_CITY_TAB = "City X Channel"
 MISC_TRADE_TAB = "Trade Party Break-up PnL"
 MISC_STMT_TAB = "P&L FY27 Statement with Reco"
@@ -858,13 +786,14 @@ MISC_CITY_LINES = {"net sales": "net_sales", "inter city": "inter", "intra city"
 MISC_STMT_LINES = {"net sales": "net_sales", "outward logistics": "logistics", "channel spends": "channel_spends",
                    "brand building costs": "brand_building", "consultancy & legal fees": "consultancy_legal",
                    "travelling & conveyance": "travel_conveyance", "gst": "gst", "software exp": "software",
-                   "others": "others", "-yield loss & wh loss": "yield_loss"}
+                   "others": "others", "-yield loss & wh loss": "yield_loss",
+                   "-intracity": "intra", "-intercity": "inter"}
 MISC_PARTY_LINES = {"net sales": "net_sales", "offers": "offers", "ads": "ads", "others": "other",
                     "salary - direct corporate": "salary_direct"}
 MISC_TRADE_GROUPS = {"MTPREMIUM", "MTMASS", "DISTRIBUTOR", "GT"}          # subtotal columns in the trade blocks
 MISC_TRADE_ALIAS = {"NB": "NATURESBASKET", "RELIANCESIGNATURE": "RELIANCE", "RELIANCESMART": "RELIANCE",
                     "METROCC": "RELIANCE", "GTS": "GT"}
-MISC_TOLERANCE = 1000.0                              # rupees: a month that misses the statement by more is refused
+MISC_TOLERANCE = 1000.0                              # rupees: a tab total further off the statement is scaled to it
 MISC_CLOSED_LINES = ("logistics", "channel_spends")  # a month is closed once the statement carries both
 
 
@@ -997,9 +926,24 @@ class PartialLoad(Exception):
     """The months that tied are written; the source still failed, and is read again next run."""
 
 
-def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str], List[str]]:
-    """{table: rows (keys + values)} for every month the MIS has closed, a note per month, and the closed
-    months that do not tie to the statement (their rows are left out, so they keep what they had)."""
+def _scale_to(rows: List[list], idx: Sequence[int], target: float) -> None:
+    """Scale columns `idx` of `rows` in place so that, rounded to paise, they sum to round(target, 2) exactly.
+    The rounding residual goes on the cell with the largest absolute value among them."""
+    total = sum(r[i] for r in rows for i in idx)
+    f = target / total
+    for r in rows:
+        for i in idx:
+            r[i] = round(r[i] * f, 2)
+    resid = round(round(target, 2) - sum(r[i] for r in rows for i in idx), 2)
+    if resid and rows:
+        r, i = max(((r, i) for r in rows for i in idx), key=lambda t: abs(t[0][t[1]]))
+        r[i] = round(r[i] + resid, 2)
+
+
+def mis_cost_rows(sheets, cur):
+    """({table: rows (keys + values)} for every month the MIS has closed, a note per month, the closed months that
+    could not be split (left out, so they keep what they had), and the tie-out checks of every closed month as
+    (month, line, tabs_total, statement_total, factor, action))."""
     stmt = _mis_statement(sheets)
     city = _mis_city_blocks(sheets, {m.month: m for m in stmt})
     mkt = _mis_party_blocks(sheets, MIS_TAB)
@@ -1009,35 +953,71 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str], List[
         trade_parties.setdefault(m, {})[_k(p)] = p
     trade = _mis_party_blocks(sheets, MISC_TRADE_TAB, trade_parties)
     out: Dict[str, List[tuple]] = {t: [] for t, _, _ in MISC_TABLES}
-    notes, refused = [], []
+    notes, refused, ties = [], [], []
     r2 = lambda x: round(x, 2)                                                  # noqa: E731
     for m in sorted(stmt):
         s, cb = stmt[m], city.get(m)
         blank = [h for h in MISC_CLOSED_LINES if not s[h]]
         if blank:                                # finance fills net sales first, the tabs and costs over days
-            notes.append(f"{m:%b %Y}: still open, the statement has no {' or '.join(blank)} yet, left to the Feeder")
+            notes.append(f"{m:%b %Y}: still open, the statement has no {' or '.join(blank)} yet "
+                         f"(provisional on the board)")
             continue
         if not cb or not cb["city"] or m not in mkt:
-            notes.append(f"{m:%b %Y}: not in every tab yet, left to the Feeder")
+            notes.append(f"{m:%b %Y}: not in every tab yet (provisional on the board)")
             continue
         cities = cb["city"]
         tot = lambda f: sum(v[f] for v in cities.values())                      # noqa: E731
         mk = mkt[m]
         tr = {p: v for p, v in trade.get(m, {}).items() if any(abs(v[h]) > 0 for h in ("offers", "ads", "other"))}
         spend = sum(v[h] for d in (mk, tr) for v in d.values() for h in ("offers", "ads", "other"))
-        checks = {"net sales": (tot("net_sales"), s["net_sales"]),
-                  "logistics": (tot("inter") + tot("intra"), s["logistics"]),
-                  "channel spends": (spend, s["channel_spends"])}
-        bad = [f"{k} {a:,.0f} vs statement {b:,.0f}" for k, (a, b) in checks.items() if abs(a - b) > MISC_TOLERANCE]
-        if bad:
-            refused.append(f"{m:%b %Y}: the tabs do not tie to the statement ({'; '.join(bad)})")
+        # the statement splits logistics into intracity / intercity; a month that does not carries only the total
+        split_ok = bool(s.get("intra") or s.get("inter")) and abs(s["intra"] + s["inter"] - s["logistics"]) <= 1
+        checks = [("net_sales", tot("net_sales"), s["net_sales"], False)]
+        if split_ok:
+            checks += [("intracity", tot("intra"), s["intra"], True), ("intercity", tot("inter"), s["inter"], True)]
+        else:
+            checks += [("logistics", tot("inter") + tot("intra"), s["logistics"], True)]
+        checks += [("channel_spends", spend, s["channel_spends"], True)]
+        actions, cannot, mties = {}, [], []
+        for line, have, want, scales in checks:
+            if abs(have - want) <= MISC_TOLERANCE:
+                act = "ok"
+            elif not scales:
+                act = "noted"
+            elif abs(have) < 1:
+                act = "refused"
+                cannot.append(f"{line.replace('_', ' ')}: the tabs carry nothing, the statement {want:,.0f}")
+            else:
+                act = "scaled"
+            actions[line] = act
+            mties.append([m, line, r2(have), r2(want), (round(want / have, 6) if act == "scaled" else None), act])
+        if cannot:
+            refused.append(f"{m:%b %Y}: cannot split onto cities / parties ({'; '.join(cannot)})")
+            for t in mties:                      # nothing of this month is loaded, so nothing was scaled
+                if t[5] == "scaled":
+                    t[4], t[5] = None, "refused"
+            ties.extend(tuple(t) for t in mties)
             continue
+        ties.extend(tuple(t) for t in mties)
+
+        logi = [[c, v["inter"], v["intra"]] for c, v in cities.items()]
+        if actions.get("intercity") == "scaled":
+            _scale_to(logi, [1], s["inter"])
+        if actions.get("intracity") == "scaled":
+            _scale_to(logi, [2], s["intra"])
+        if actions.get("logistics") == "scaled":
+            _scale_to(logi, [1, 2], s["logistics"])
+        spends = [[p, v["offers"], v["ads"], v["other"]] for p, v in list(mk.items()) + list(tr.items())]
+        if actions["channel_spends"] == "scaled":
+            _scale_to(spends, [1, 2, 3], s["channel_spends"])
+
         five = sum(s[h] for h in ("consultancy_legal", "travel_conveyance", "gst", "software", "others"))
+        for c, inter, intra in logi:
+            out["pnl_logistics_cost"].append((m, c, r2(inter), r2(intra)))
         for c, v in cities.items():
-            out["pnl_logistics_cost"].append((m, c, r2(v["inter"]), r2(v["intra"])))
             out["pnl_rent_utilities"].append((m, c, r2(v["rent"])))
-        for p, v in list(mk.items()) + list(tr.items()):
-            out["pnl_channel_spend"].append((m, p, r2(v["offers"]), r2(v["ads"]), r2(v["other"])))
+        for p, offers, ads, other in spends:
+            out["pnl_channel_spend"].append((m, p, r2(offers), r2(ads), r2(other)))
         out["pnl_brand_building"].append((m, r2(s["brand_building"]), r2(tot("salary_corporate"))))
         sd_mkt = sum(v["salary_direct"] for v in mk.values())
         out["pnl_salary_direct"].append((m, r2(sd_mkt), r2(tot("salary_direct") - sd_mkt)))
@@ -1046,10 +1026,14 @@ def mis_cost_rows(sheets, cur) -> Tuple[Dict[str, List[tuple]], List[str], List[
                                               r2(s["others"])))
         out["mis_yield_month"].append((m, r2(s["yield_loss"])))
         unplaced = sorted(p for p in tr if p not in trade_parties.get(m, {}).values())
-        notes.append(f"{m:%b %Y}: logistics {tot('inter') + tot('intra'):,.0f}, channel spends {spend:,.0f} "
-                     f"({len(mk)} marketplace + {len(tr)} trade parties"
-                     + (f"; not a Birbal trade party, so spread: {', '.join(unplaced)}" if unplaced else "") + ")")
-    return out, notes, refused
+        scaled = [f"{t[1].replace('_', ' ')} x{t[4]:.6f}" for t in mties if t[5] == "scaled"]
+        off = [f"net sales {t[2]:,.0f} vs statement {t[3]:,.0f}" for t in mties if t[5] == "noted"]
+        notes.append(f"{m:%b %Y}: logistics {sum(r[1] + r[2] for r in logi):,.0f}, channel spends "
+                     f"{sum(r[1] + r[2] + r[3] for r in spends):,.0f} ({len(mk)} marketplace + {len(tr)} trade parties"
+                     + (f"; not a Birbal trade party, so spread: {', '.join(unplaced)}" if unplaced else "") + ")"
+                     + (f"; SCALED to the statement: {', '.join(scaled)}" if scaled else "")
+                     + (f"; tabs off the statement, recorded only: {', '.join(off)}" if off else ""))
+    return out, notes, refused, ties
 
 
 def _norm_row(r) -> tuple:
@@ -1057,14 +1041,30 @@ def _norm_row(r) -> tuple:
 
 
 def load_mis_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
-    rows, notes, refused = mis_cost_rows(sheets, cur)
+    rows, notes, refused, ties = mis_cost_rows(sheets, cur)
     for n in notes:
         logger.info("  %s", n)
+    for t in ties:
+        if t[5] != "ok":
+            logger.warning("  tie-out %s %s: tabs %s, statement %s -> %s", f"{t[0]:%b %Y}", t[1], f"{t[2]:,.2f}",
+                           f"{t[3]:,.2f}", t[5] + (f" x{t[4]}" if t[4] else ""))
     months = sorted({r[0] for r in rows["pnl_brand_building"]})
     read = sum(len(v) for v in rows.values())
     span = f"{len(months)} months" + (f" {months[0]}..{months[-1]}" if months else "")
+    scaled = []
+    for t in ties:
+        if t[5] == "scaled" and f"{t[0]:%b %Y}" not in scaled:
+            scaled.append(f"{t[0]:%b %Y}")
     ins = gone_all = 0
     detail = []
+    if write:
+        # the checks read this time replace every earlier one: a month no longer closed keeps none
+        cur.execute("delete from public.mis_costs_tieout where true")
+        one = "(%s, %s, %s, %s, %s, %s)"
+        for i in range(0, len(ties), CHUNK):
+            part = ties[i:i + CHUNK]
+            cur.execute("insert into public.mis_costs_tieout (month, line, tabs_total, statement_total, factor, action) "
+                        "values " + ", ".join([one] * len(part)), [v for t in part for v in t])
     for table, keys, vals in MISC_TABLES if write and months else ():
         cols = keys + vals
         cur.execute(f"select {', '.join(cols)}, source from public.{table} where month = any(%s)", [months])
@@ -1087,11 +1087,286 @@ def load_mis_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
                         [v for r in part for v in r])
         ins, gone_all = ins + len(put), gone_all + gone
         detail.append(f"{table}: {len(changed)} months replaced (-{gone} +{len(put)})")
+    if scaled:
+        detail.append("scaled to the statement: " + ", ".join(scaled))
     if refused:
         raise PartialLoad(f"{'; '.join(refused)}. Those months keep what they had; {span} went through.")
     if not write or not months:
-        return read, 0, 0, span
+        return read, 0, 0, span + (f"; would scale {', '.join(scaled)}" if scaled else "")
     return read, ins, gone_all, f"{span}; " + ("; ".join(detail) or "no row changed")
+
+
+# --------------------------------------------------------------------------- #
+# Management MIS FY27 -> mis_mgmt_lines: finance's P&L ladder, for the /mis reco (Birbal 255)              #
+# --------------------------------------------------------------------------- #
+# The reco on the /mis board compares Birbal's P&L with finance's, line by line, at three grains:
+#   total    the "Total" column of every month's Actual block in "YTD Channelwise" (it equals the statement on every
+#            line the statement carries, checked Apr-Oct 2026; unlike the statement it keeps Salary - Direct Corporate
+#            and the gratuity provision as their own lines, which the statement folds into Salary - Corporate in
+#            some months and leaves out in others)
+#   channel  the same block's Marketplaces / AC / Trade columns
+#   party    the party columns of "Marketplace Party Break-up PnL" and "Trade Party Break-up PnL" (the trade tab's
+#            group subtotals MT Premium / MT Mass / Distributor / GT are skipped; party names are the sheet's own,
+#            matched to Birbal's party master by letters and digits in the reco)
+# Lines are matched on their LABELS in column A, keyed by the warehouse.pnl_lines column they compare with. The
+# first "Others" is the channel spend line; one after "Corporate Overheads" is that head's own "Others".
+# The whole table is replaced on each load (guarded: a read of fewer than 200 rows writes nothing).
+MISL_CHANNEL_TAB = "YTD Channelwise"
+MISL_LINES = {
+    "gmv": "gmv", "discounts/trade margin": "discount", "gross billing": "gross_billing", "cancelled": "cancelled",
+    "short grn": "short_grn", "adjusted gross billing": "adjusted_gross_billing", "less returns": "returns",
+    "rtv": "rtv", "capping": "capping", "consumer sales": "consumer_sale", "gross sales": "consumer_sale",
+    "less gst": "gst", "net sales": "net_sales", "cogs": "cogs", "material expenses": "material_expense",
+    "manufacturing expenses": "manufacturing_expense", "yield / wh loss": "yield_loss",
+    "gross margin": "gross_margin", "distribution partner costs": "distribution_partner_cost",
+    "logistics cost": "logistics_cost", "intracity cost": "intracity", "intercity cost": "intercity",
+    "cm 1": "cm1", "other marketing exp": "other_marketing_exp", "channel spends": "channel_spends",
+    "offers": "offers", "ads": "ads", "others": "other_channel_spend",
+    "salaries stores & promoters": "store_salaries", "store operating costs": "store_operating_cost",
+    "cm 2": "cm2", "brand building costs": "brand_building", "brand building cost": "brand_building",
+    "cm 3": "cm3", "salary - corporate": "salary_corporate", "salary - direct corporate": "salary_direct",
+    "rent and utilities": "rent_utilities", "corporate overheads": "corporate_overheads",
+    "provision for gratuity & pl": "oh_gratuity", "consultancy & legal fees": "oh_consultancy_legal",
+    "travelling & conveyance": "oh_travel_conveyance", "gst": "oh_gst", "software exp": "oh_software",
+    "ebitda": "ebitda"}
+MISL_CHANNELS = {"marketplace": "MARKETPLACE", "marketplaces": "MARKETPLACE", "ac": "AC", "trade": "TRADE",
+                 "total": "TOTAL"}
+MISL_COLS = ["month", "grain", "channel", "member", "line", "amount", "source_tab"]
+
+
+def _misl_rows(grid, col: int = 0) -> Dict[str, int]:
+    """{line: row} of the ladder in column `col`, down to EBITDA."""
+    out: Dict[str, int] = {}
+    seen_oh = False
+    for r, row in enumerate(grid):
+        lab = _label(_cell(row, col))
+        if lab == "others" and seen_oh:
+            out.setdefault("oh_others", r)
+        elif lab in MISL_LINES and MISL_LINES[lab] not in out:
+            out[MISL_LINES[lab]] = r
+        if lab == "corporate overheads":
+            seen_oh = True
+        if lab == "ebitda":
+            break
+    for need in ("net_sales", "gross_margin", "ebitda"):
+        if need not in out:
+            raise ValueError(f"line {need!r} not found; the tab's labels changed")
+    return out
+
+
+def _misl_channel(sheets) -> List[tuple]:
+    grid = _grid(sheets, MIS_SHEET, MISL_CHANNEL_TAB, cols="MZ", rows=120)
+    hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
+    if hr is None or hr < 2:
+        raise ValueError(f"tab {MISL_CHANNEL_TAB!r}: header row not found")
+    lines = _misl_rows(grid)
+    kind_row, month_row, name_row = grid[hr - 2], grid[hr - 1], grid[hr]
+    width = max(len(r) for r in grid[:hr + 1])
+    kind = month = None
+    out = []
+    for c in range(width):
+        k, mv = _cell(kind_row, c), _cell(month_row, c)
+        if k not in (None, ""):
+            kind = _label(k)
+        if mv not in (None, ""):
+            month = _serial_month(mv)        # None for the YTD blocks, whose header is text
+        ch = MISL_CHANNELS.get(_label(_cell(name_row, c)))
+        if kind != "actual" or month is None or ch is None:
+            continue
+        vals = {ln: _num(_cell(grid[r], c)) for ln, r in lines.items()}
+        if not vals.get("net_sales"):
+            continue                          # a month finance has not filled
+        grain = "total" if ch == "TOTAL" else "channel"
+        for ln, v in vals.items():
+            if v is not None:
+                out.append((month, grain, ch, "Total" if grain == "total" else ch, ln, round(v, 2), MISL_CHANNEL_TAB))
+    return out
+
+
+def _misl_party(sheets, tab: str, channel: str) -> List[tuple]:
+    grid = _grid(sheets, MIS_SHEET, tab, cols="NZ", rows=120)
+    hr = next((i for i, row in enumerate(grid) if _label(_cell(row, 0)) == MISC_HDR_LABEL), None)
+    if hr is None:
+        raise ValueError(f"tab {tab!r}: header row not found")
+    lines = _misl_rows(grid)
+    month, out, blocks = None, [], {}
+    for c, v in enumerate(grid[hr]):
+        sm = _serial_month(v)
+        if sm:
+            month = sm
+            continue
+        if month is None or not isinstance(v, str) or not v.strip():
+            continue                          # the YTD columns before the first month block
+        name = re.sub(r"\s+", " ", v).strip()
+        if channel == "TRADE" and _k(name) in MISC_TRADE_GROUPS:
+            continue
+        acc = blocks.setdefault(month, {}).setdefault(name, {})
+        for ln, r in lines.items():
+            x = _num(_cell(grid[r], c))
+            if x is not None:
+                acc[ln] = acc.get(ln, 0.0) + x
+    for month, parties in blocks.items():
+        if not any(abs(p.get("net_sales") or 0) > 0 for p in parties.values()):
+            continue                          # template block of a month finance has not filled
+        for name, vals in parties.items():
+            if not any(abs(x) > 0 for x in vals.values()):
+                continue
+            for ln, x in vals.items():
+                out.append((month, "party", channel, name, ln, round(x, 2), tab))
+    return out
+
+
+def load_mis_lines(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    rows = _misl_channel(sheets) + _misl_party(sheets, MIS_TAB, "MARKETPLACE") \
+        + _misl_party(sheets, MISC_TRADE_TAB, "TRADE")
+    seen: Dict[tuple, tuple] = {}
+    for r in rows:
+        key = (r[0], r[1], r[2], r[3], r[4])
+        if key in seen and r[1] == "party":
+            prev = seen[key]                  # the same name twice in one block: add them
+            r = prev[:5] + (round(prev[5] + r[5], 2),) + prev[6:]
+        seen[key] = r
+    rows = list(seen.values())
+    months = sorted({r[0] for r in rows})
+    by = {g: sum(1 for r in rows if r[1] == g) for g in ("total", "channel", "party")}
+    detail = (f"{len(rows)} rows ({by['total']} total, {by['channel']} channel, {by['party']} party), "
+              + (f"{months[0]}..{months[-1]}" if months else "empty"))
+    if not write:
+        return len(rows), 0, 0, detail
+    if len(rows) < 200:
+        raise ValueError(f"only {len(rows)} rows read; refusing to replace mis_mgmt_lines with so little")
+    cur.execute("delete from public.mis_mgmt_lines where true")
+    gone = cur.rowcount
+    one = "(" + ", ".join(["%s"] * len(MISL_COLS)) + ")"
+    for i in range(0, len(rows), CHUNK):
+        part = rows[i:i + CHUNK]
+        cur.execute(f"insert into public.mis_mgmt_lines ({', '.join(MISL_COLS)}) values " + ", ".join([one] * len(part)),
+                    [v for r in part for v in r])
+    return len(rows), len(rows), gone, f"{detail}; replaced {gone} rows"
+
+
+# --------------------------------------------------------------------------- #
+# Plant Costs FY 27 -> mfg_expense_month (manufacturing expense; was the manual load_mfg_expense.py)          #
+# --------------------------------------------------------------------------- #
+# Owner 2026-11-16: manufacturing stays on the "Department Targets" sheet's "Plant Costs FY 27" tab, column
+# "Actual (finance)", and is loaded automatically. The tab is a matrix: row 1 the month (April'26 ... March'27) over
+# an Estimate / Actual (finance) pair, row 3 the plant-cost total, row 4 the sheet's own per-unit, row 5 its
+# 'Comm Units' (both kept only as a cross-check; Birbal's rate divides by the MIS's own FG adjusted qty, 168).
+# A month with an actual loads, even a partly-filled open month: the board marks a month finance has not closed in
+# the Management MIS as provisional (Birbal 255). Finance restates past months in place; every load rewrites them.
+PLANT_SHEET = os.environ.get("PLANT_SHEET", "1qJSknodAAjCA_6T6NI7_NSRl5eqkSCTTTUQTXLHvrTE")
+PLANT_TAB = "Plant Costs FY 27"
+PLANT_MONTHS = {"april": 4, "may": 5, "june": 6, "july": 7, "aug": 8, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+                "jan": 1, "feb": 2, "march": 3}
+PLANT_ROW_TOTAL, PLANT_ROW_PER_UNIT, PLANT_ROW_UNITS = 2, 3, 4
+
+
+def load_plant_costs(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    grid = _grid(sheets, PLANT_SHEET, PLANT_TAB, cols="BZ", rows=30)
+    if len(grid) <= PLANT_ROW_UNITS or _label(_cell(grid[PLANT_ROW_UNITS], 0)) != "comm units":
+        raise ValueError(f"tab {PLANT_TAB!r}: row {PLANT_ROW_UNITS + 1} is not 'Comm Units'; the layout changed, "
+                         f"refusing to read shifted rows")
+    header, sub = grid[0], grid[1]
+    rows = []
+    for i, h in enumerate(header):
+        mm = re.match(r"([A-Za-z]+)'(\d{2})", str(h).strip())
+        mon = PLANT_MONTHS.get(mm.group(1).lower()) if mm else None
+        if not mon:
+            continue
+        year = 2000 + int(mm.group(2)) + (1 if mon <= 3 else 0)
+        j = next((k for k in (i, i + 1) if "actual" in str(_cell(sub, k) or "").lower()), None)
+        if j is None:
+            continue
+        actual = _num(_cell(grid[PLANT_ROW_TOTAL], j))
+        if not actual:
+            continue                          # nothing booked for the month yet
+        est = j - 1 if j > i else j + 1
+        rows.append((dt.date(year, mon, 1), round(actual, 2), _num(_cell(grid[PLANT_ROW_TOTAL], est)),
+                     _num(_cell(grid[PLANT_ROW_UNITS], j)), _num(_cell(grid[PLANT_ROW_PER_UNIT], j)), PLANT_TAB))
+    rows.sort()
+    detail = ", ".join(f"{r[0]:%b %y} {r[1]:,.0f}" for r in rows) or "no month with an actual"
+    if not write or not rows:
+        return len(rows), 0, 0, detail
+    ins, upd = merge(cur, "mfg_expense_month",
+                     ["month", "actual_finance", "estimate", "sheet_comm_units", "sheet_per_unit", "source_tab"],
+                     ["month"], rows, touch="loaded_at")
+    return len(rows), ins, upd, detail
+
+
+# --------------------------------------------------------------------------- #
+# Management MIS -> pnl_direct_salary(+_platform): direct salary per employee (was manual load_pnl_salary.py) #
+# --------------------------------------------------------------------------- #
+# The working area of "Marketplace Party Break-up PnL", one block per month at the P&L's own month columns:
+# rows 120-140 employee name, the salary allocated to each channel, the total 12 columns on; rows 145-165 the same
+# employees with a 1/0 flag per channel. A person's salary is split over ONLY the channels they are flagged against,
+# pro rata to the month's adjusted gross billing (verified to the rupee); Birbal stores the salary and the flags and
+# recomputes the split from its own billing. A month's rows are REPLACED as a whole on each load, so a person or a
+# flag finance removed goes (the manual loader only ever added: Jun / Aug 2026 kept 5 / 19 stale flags).
+SAL_HDR_ROW, SAL_ROWS, SAL_FLAG_ROWS, SAL_TOTAL_OFFSET = 2, (119, 139), (144, 164), 12
+
+
+def _salary_parse(g):
+    cell = lambda r, i: _cell(g[r], i) if r < len(g) else None          # noqa: E731
+    width = max(len(r) for r in g)
+    name_cols = [i for i in range(width)
+                 if isinstance(cell(SAL_ROWS[0], i), str) and str(cell(SAL_ROWS[0], i)).strip()
+                 and isinstance(cell(SAL_HDR_ROW, i), (int, float)) and not isinstance(cell(SAL_HDR_ROW, i), bool)]
+    if not name_cols:
+        raise ValueError(f"tab {MIS_TAB!r}: no direct salary blocks at rows {SAL_ROWS[0] + 1}-{SAL_ROWS[1] + 1}; "
+                         f"the layout changed")
+    salaries, flags, alloc = {}, {}, {}
+    for c0 in name_cols:
+        month = EPOCH + dt.timedelta(days=int(cell(SAL_HDR_ROW, c0)))
+        channels = [(k, str(cell(SAL_HDR_ROW, c0 + k)).strip()) for k in range(1, SAL_TOTAL_OFFSET)
+                    if str(cell(SAL_HDR_ROW, c0 + k) or "").strip()]
+        if not channels:
+            raise ValueError(f"tab {MIS_TAB!r}: salary block {month}: no channel headers")
+        for r in range(SAL_ROWS[0], SAL_ROWS[1] + 1):
+            name = str(cell(r, c0) or "").strip()
+            total = _num(cell(r, c0 + SAL_TOTAL_OFFSET))
+            if not name or total is None:
+                continue
+            salaries[(month, name)] = total
+            for k, ch in channels:
+                a = _num(cell(r, c0 + k))
+                if a:
+                    alloc[(month, name, ch)] = a
+        for r in range(SAL_FLAG_ROWS[0], SAL_FLAG_ROWS[1] + 1):
+            name = str(cell(r, c0) or "").strip()
+            if not name:
+                continue
+            for k, ch in channels:
+                if _num(cell(r, c0 + k)):
+                    flags[(month, name, ch)] = True
+    for key in alloc:                        # a month with no flag matrix: an allocation IS a flag
+        flags.setdefault(key, True)
+    return salaries, flags, alloc
+
+
+def load_mis_direct_salary(sheets, cur, write: bool) -> Tuple[int, int, int, str]:
+    g = _grid(sheets, MIS_SHEET, MIS_TAB, cols="GZ", rows=170)
+    salaries, flags, alloc = _salary_parse(g)
+    months = sorted({m for m, _ in salaries})
+    detail = ", ".join(f"{m:%b %y} {sum(v for (mm, _), v in salaries.items() if mm == m):,.0f}"
+                       f" ({sum(1 for (mm, _) in salaries if mm == m)} people)" for m in months)
+    read = len(salaries) + len(flags)
+    if not write or not months:
+        return read, 0, 0, detail
+    cur.execute("delete from public.pnl_direct_salary_platform where month = any(%s)", [months])
+    g1 = cur.rowcount
+    cur.execute("delete from public.pnl_direct_salary where month = any(%s)", [months])
+    g2 = cur.rowcount
+    sal = [(m, n, v) for (m, n), v in sorted(salaries.items())]
+    fl = [(m, n, ch, alloc.get((m, n, ch))) for (m, n, ch) in sorted(flags)]
+    for i in range(0, len(sal), CHUNK):
+        part = sal[i:i + CHUNK]
+        cur.execute("insert into public.pnl_direct_salary (month, employee, salary) values "
+                    + ", ".join(["(%s, %s, %s)"] * len(part)), [v for r in part for v in r])
+    for i in range(0, len(fl), CHUNK):
+        part = fl[i:i + CHUNK]
+        cur.execute("insert into public.pnl_direct_salary_platform (month, employee, sheet_party, sheet_allocated) "
+                    "values " + ", ".join(["(%s, %s, %s, %s)"] * len(part)), [v for r in part for v in r])
+    return read, len(sal) + len(fl), g1 + g2, f"{detail}; replaced {g1 + g2} rows"
 
 
 @dataclass
@@ -1103,7 +1378,6 @@ class SheetSource:
 
 SOURCES = [
     SheetSource("campaign_master", CAMPAIGN_SHEET, load_campaign_master),
-    SheetSource("pnl_feeder", FEEDER_SHEET, load_feeder),
     SheetSource("mis_costs", MIS_SHEET, load_mis_costs),
     SheetSource("party_master", PARTY_MASTER_SHEET, load_party_master),
     SheetSource("prn_bb", PRN_BB_SHEET, load_prn_bb),
@@ -1111,6 +1385,9 @@ SOURCES = [
     SheetSource("capping_booked", CAPPING_SHEET, load_capping_booked),
     SheetSource("platform_foc", FOC_SHEET, load_platform_foc),
     SheetSource("mis_party_pnl", MIS_SHEET, load_mis_party_pnl),
+    SheetSource("mis_lines", MIS_SHEET, load_mis_lines),
+    SheetSource("mis_direct_salary", MIS_SHEET, load_mis_direct_salary),
+    SheetSource("plant_costs", PLANT_SHEET, load_plant_costs),
 ]
 
 

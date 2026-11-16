@@ -4,7 +4,11 @@ name: P&L sheets -> Supabase
 # (python -m mp.sheets, see its docstring):
 #
 #   campaign_master  Ecom Campaign Master -> ref_ads_campaign, ref_ads_name_map
-#   pnl_feeder       P&L Feeder File      -> the seven pnl_* cost tables
+#   mis_costs, mis_lines, mis_direct_salary, mis_party_pnl
+#                    Management MIS FY27  -> the pnl_* cost tables, mis_mgmt_lines (the /mis reco),
+#                                            pnl_direct_salary, powerbi.mp_mis_party_pnl
+#   plant_costs      Plant Costs FY 27    -> mfg_expense_month (manufacturing)
+#   (the P&L Feeder File is retired since 2026-11-16)
 #   party_master, prn_bb, prn_nb           -> ref_party_master, prn_marketing_lines
 #   capping_booked   ERP Capping RTV Data -> rtv_capping_booked (the ledger is
 #                    rebuilt by the same o2c_refresh() beat)
