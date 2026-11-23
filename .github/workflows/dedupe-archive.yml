@@ -1,0 +1,59 @@
+name: Dedupe log -> Drive archive (monthly)
+
+# mp_dedupe_log keeps a full copy of every row the dedupe guard / trashed sweep deletes
+# (row_data, ~1 KB a row). Copies older than 14 days go to birbal@ Drive > Supabase Backups
+# as gzip JSON lines, are checked against Drive's size + md5, and only then cleared in the
+# table (mp/dedupe_archive.py). The log rows themselves stay. First clean-up by hand 2026-11-23.
+#
+# Its own concurrency group on purpose: sharing marketplace-sync's group would let the next
+# pg_cron sync dispatch cancel this run while it waits. The two do not collide - this only
+# clears row_data on rows older than 14 days; the sync only inserts new log rows.
+
+on:
+  schedule:
+    - cron: "30 20 1 * *"     # 02:00 IST on the 2nd of every month
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Export, upload and clear (unticked = dry run: counts only)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: dedupe-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Write credentials
+        env:
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
+          python -c "import json;json.load(open('token.json'));print('token.json parsed OK')"
+
+      - name: Archive and clear
+        env:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.apply }}" = "true" ]; then
+            python -m mp.dedupe_archive --apply
+          else
+            python -m mp.dedupe_archive
+          fi
